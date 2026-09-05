@@ -1,7 +1,7 @@
-<!-- version: 1.14.0 -->
-<!-- Last updated: 2026-07-16 -->
+<!-- version: 1.15.0 -->
+<!-- Last updated: 2026-09-05 -->
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-09-05
 
 **Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
 
@@ -90,6 +90,7 @@ mirror. `gitnexus/test/unit/shipped-skills-sync.test.ts` guards the copies. Toke
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-09-05 | 1.15.0 | Testing section: added single-test commands, eval harness (`uv run pytest`/`ruff`), Playwright ignore note. Added "Architecture in one paragraph". Gotchas: fixed lint scripts (root `npm run lint`), clarified vendored vs npm grammar toolchain split. |
 | 2026-07-20 | 1.14.0 | `gitnexus-review` gains a coordinated swarm: six `ci-personas/` lanes the CI review agent dispatches as subagents (via the `Agent` tool), with a bounded critic gate and sidechain-excluded evidence. |
 | 2026-07-16 | 1.13.0 | `gitnexus-plan` asks plan depth up front (quick/standard/deep) in interactive runs; `gitnexus-lfg` gate slimmed to proceed/stop (Deepen stays as the route-back mechanism). |
 | 2026-07-16 | 1.12.0 | Renamed `gitnexus-pr-review` to `gitnexus-review`; added PR URL/number, branch/range, and local-change targets plus install migration (setup warns on a legacy `gitnexus-pr-review` dir and leaves it in place; uninstall removes it). |
@@ -167,6 +168,10 @@ This project is indexed by GitNexus as **GitNexus** (248612 symbols, 565510 rela
 | Cursor Integration | `gitnexus-cursor-integration/` | Static config for Cursor editor. |
 | Eval | `eval/` | Python evaluation harness (Docker + LLM API keys). |
 
+### Architecture in one paragraph
+
+`gitnexus/` is the npm-published CLI/core. `src/core/ingestion/` parses via tree-sitter into a symbol graph; all languages resolve calls/inheritance through the scope-resolution pipeline (`Registry.lookup` → `preEmitInheritanceEdges`/`emitHeritageEdges` → `buildMro` → `MethodDispatchIndex`) — language behavior plugs in via `LanguageProvider`/`ScopeResolver`, and shared ingestion code must stay language-agnostic. `src/core/graph|search|embeddings` sit on top; `src/storage` (LadybugDB) persists the graph; `src/mcp` exposes 16 MCP tools and `src/server` the HTTP API that `gitnexus-web/` (React/Vite thin client) consumes exclusively via `gitnexus serve`. The PDG layer (CDG + REACHING_DEF, `--pdg`) powers statement-level impact and taint analysis.
+
 ### Running services
 
 ```bash
@@ -185,13 +190,24 @@ npx gitnexus serve                         # HTTP API on port 4747 (from any ind
 
 **Web UI (`gitnexus-web/`)**
 - `npm test` — vitest (~200 tests)
-- `npm run test:e2e` — Playwright (7 spec files; requires `gitnexus serve` + `npm run dev`)
+- `npm run test:e2e` — Playwright (7 spec files; requires `gitnexus serve` + `npm run dev`). `manual-record.spec.ts` and `debug-issues.spec.ts` are always ignored (see `playwright.config.ts`).
 - `npx tsc -b --noEmit` — typecheck
+
+**Single tests (both TS packages)**
+- Single file: `npx vitest run test/unit/<file>.test.ts` (same pattern in `gitnexus-web/`)
+- Single test by name: `npx vitest run -t "test name"`
+- Watch mode: `npm run test:watch`
+
+**Eval (`eval/`, Python)**
+- Tests: `cd eval && uv run pytest tests/` (single: `uv run pytest tests/test_x.py::test_name`)
+- Lint: `cd eval && uv run ruff check .`
+- Run: `cd eval && uv run python run_eval.py --config configs/<config>.yaml`
+- Debug: set `GITNEXUS_EVAL_DEBUG=1` for full tracebacks. Shared constants in `eval/constants.py`; tool specs in `eval/tool_registry.py`.
 
 **Pre-commit hook** (`.husky/pre-commit`): formatting (prettier via lint-staged) + typecheck for staged packages. Tests do **not** run in pre-commit — CI only.
 
 ### Gotchas
 
 - `npm install` in `gitnexus/` triggers `prepare` (builds via `tsc`) and `postinstall` (`build-tree-sitter-grammars.cjs` activates committed prebuilds in place under `vendor/`, and only source-builds when none matches). A C/C++ toolchain (`python3`, `make`, `g++`) is needed only for that source-build fallback.
-- The vendored grammars `tree-sitter-{c,dart,proto,swift,kotlin,zig}` are handled uniformly: c is required; dart/proto/swift/kotlin/zig are optional and skippable via `GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1`. Install warnings appear only when no prebuild matches the platform-arch and no toolchain is present, and are non-fatal — only that language's parsing is unavailable.
-- ESLint configured via `eslint.config.mjs` (TS, React Hooks, unused-imports). No `npm run lint` script; use `npx eslint .`. Prettier runs via lint-staged. CI checks both in `ci-quality.yml`.
+- The vendored grammars `tree-sitter-{c,dart,proto,swift,kotlin,zig}` are handled uniformly: c is required; dart/proto/swift/kotlin/zig are optional and skippable via `GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1`. Install warnings appear only when no prebuild matches the platform-arch and no toolchain is present, and are non-fatal — only that language's parsing is unavailable. Non-vendored grammars (`c-sharp`, `cpp`, `go`, `java`, `javascript`, `php`, `python`, `ruby`, `rust`, `typescript`) are npm dependencies that build from source — the C/C++ toolchain note applies to those too.
+- ESLint configured via `eslint.config.mjs` (TS, React Hooks, unused-imports). Root: `npm run lint` / `npm run lint:fix` / `npm run format:check`. The `gitnexus/` and `gitnexus-web/` packages have no lint script — use `npx eslint .` there. Prettier runs via lint-staged. CI checks both in `ci-quality.yml`.
