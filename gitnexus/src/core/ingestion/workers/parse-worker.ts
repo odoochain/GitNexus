@@ -58,7 +58,7 @@ type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
 // `isLanguageAvailable` must re-introduce the gate here. (The cleaner end-state
 // — routing this table through `parser-loader.getLanguageGrammar` so there is
 // one loader — is the deferred Tier-1 consolidation.)
-// Swift/Dart/Kotlin/C are vendored grammars loaded from `vendor/` by absolute
+// Swift/Dart/Kotlin/C/Zig are vendored grammars loaded from `vendor/` by absolute
 // path (NEVER copied into node_modules — see vendored-grammars.ts / #2111). Each
 // may be absent on a platform without a prebuild or a toolchain-less /
 // `--ignore-scripts` install, so every load is guarded so a missing binding
@@ -81,6 +81,11 @@ try {
 let C: TreeSitterLanguage | null = null;
 try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
+} catch {}
+
+let Zig: TreeSitterLanguage | null = null;
+try {
+  Zig = requireVendoredGrammar('tree-sitter-zig') as TreeSitterLanguage;
 } catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
@@ -561,6 +566,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Vue]: TypeScript.typescript,
   ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(Zig ? { [SupportedLanguages.Zig]: Zig } : {}),
 };
 
 /**
@@ -629,6 +635,27 @@ function findEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
     current = current.parent;
   }
   return null;
+}
+
+/**
+ * `findEnclosingClassNode`, extended with the provider's file-level owner:
+ * when no container encloses `node` but the language says the FILE itself is
+ * a type (`resolveFileTypeOwner`, e.g. a Zig file-struct), the tree root is
+ * the owner node the method/field extractors should read members from. Same
+ * root, same name as `findEnclosingClassInfo`'s root branch, so member ids and
+ * owner ids agree.
+ */
+function findEnclosingClassNodeOrFileOwner(
+  node: SyntaxNode,
+  provider: LanguageProvider,
+  filePath: string,
+): SyntaxNode | null {
+  const container = findEnclosingClassNode(node);
+  if (container !== null) return container;
+  if (provider.resolveFileTypeOwner === undefined) return null;
+  let root: SyntaxNode = node;
+  while (root.parent) root = root.parent;
+  return provider.resolveFileTypeOwner(root, filePath) !== null ? root : null;
 }
 
 /**
@@ -931,7 +958,14 @@ const callableOwnQualifiedName = (
   const prefix = enclosingCallablePrefix(fnNode, filePath, provider);
   const classInfo =
     prefix === undefined
-      ? cachedFindEnclosingClassInfo(fnNode, filePath, provider.resolveEnclosingOwner)
+      ? cachedFindEnclosingClassInfo(
+          fnNode,
+          filePath,
+          provider.resolveEnclosingOwner,
+          undefined,
+          provider.resolveFileTypeOwner,
+          provider.resolveContainerTypeOwner,
+        )
       : null;
   const objectOwner =
     prefix === undefined && classInfo === null && shouldObjectOwnerQualifyCallable(finalLabel)
@@ -989,6 +1023,9 @@ const findEnclosingFunctionId = (
           current,
           filePath,
           provider.resolveEnclosingOwner,
+          undefined,
+          provider.resolveFileTypeOwner,
+          provider.resolveContainerTypeOwner,
         );
         const encLang = getLanguageFromFilename(filePath);
         const standaloneMethodInfo =
@@ -1043,8 +1080,12 @@ const findEnclosingFunctionId = (
               ? undefined
               : standaloneMethodInfo.parameters.length;
           } else {
+            // Same owner lookup as the definition-phase Method id builder: a Zig
+            // file-struct's top-level fn is owned by the file root, and its
+            // id carries the `#<arity>` suffix only if that owner is found.
             const classNode =
-              findEnclosingClassNode(current) ?? findClassNodeByQualifiedName(current);
+              findEnclosingClassNodeOrFileOwner(current, provider, filePath) ??
+              findClassNodeByQualifiedName(current);
             if (classNode && encLang) {
               const methodMap = getMethodInfo(classNode, provider, {
                 filePath,
@@ -1090,6 +1131,9 @@ const findEnclosingFunctionId = (
           current.previousSibling ?? current,
           filePath,
           provider.resolveEnclosingOwner,
+          undefined,
+          provider.resolveFileTypeOwner,
+          provider.resolveContainerTypeOwner,
         );
         // Same nesting rule as the generic branch above (#2699). Anchored on
         // `sigNode`-equivalent (`current.previousSibling ?? current`) so Dart,
@@ -1154,6 +1198,8 @@ const cachedFindEnclosingClassInfo = (
   filePath: string,
   resolveEnclosingOwner?: (node: SyntaxNode) => SyntaxNode | null,
   getQualifiedOwnerName?: (node: SyntaxNode, simpleName: string) => string | null,
+  resolveFileTypeOwner?: LanguageProvider['resolveFileTypeOwner'],
+  resolveContainerTypeOwner?: LanguageProvider['resolveContainerTypeOwner'],
 ): EnclosingClassInfo | null => {
   const cached = classIdCache.get(node);
   if (cached !== undefined) return cached;
@@ -1163,6 +1209,8 @@ const cachedFindEnclosingClassInfo = (
     filePath,
     resolveEnclosingOwner,
     getQualifiedOwnerName,
+    resolveFileTypeOwner,
+    resolveContainerTypeOwner,
   );
   classIdCache.set(node, result);
   return result;
@@ -2020,6 +2068,8 @@ const processFileGroup = (
                   file.path,
                   provider.resolveEnclosingOwner,
                   propGetQualifiedOwnerName,
+                  provider.resolveFileTypeOwner,
+                  provider.resolveContainerTypeOwner,
                 );
                 const propEnclosingClassId =
                   propEnclosingInfo?.qualifiedClassId ?? propEnclosingInfo?.classId ?? null;
@@ -2191,6 +2241,7 @@ const processFileGroup = (
           ? provider.classExtractor.extract(definitionNode, {
               name: nameNode?.text,
               type: defaultNodeLabel,
+              filePath: file.path,
             })
           : null;
       const nodeLabel = extractedClassSymbol?.type ?? defaultNodeLabel;
@@ -2199,7 +2250,8 @@ const processFileGroup = (
         nodeLabel === 'Struct' ||
         nodeLabel === 'Interface' ||
         nodeLabel === 'Enum' ||
-        nodeLabel === 'Record';
+        nodeLabel === 'Record' ||
+        nodeLabel === 'Union';
       if (
         isClassLikeLabel &&
         provider.classExtractor?.shouldSkipClassCapture?.({
@@ -2426,6 +2478,8 @@ const processFileGroup = (
               file.path,
               provider.resolveEnclosingOwner,
               getQualifiedOwnerName,
+              provider.resolveFileTypeOwner,
+              provider.resolveContainerTypeOwner,
             )
           : null;
       const enclosingClassId =
@@ -2641,7 +2695,8 @@ const processFileGroup = (
         let enrichedByMethodExtractor = false;
         if (provider.methodExtractor && definitionNode) {
           const classNode =
-            findEnclosingClassNode(definitionNode) ?? findClassNodeByQualifiedName(definitionNode);
+            findEnclosingClassNodeOrFileOwner(definitionNode, provider, file.path) ??
+            findClassNodeByQualifiedName(definitionNode);
           if (classNode) {
             const methodMap = getMethodInfo(classNode, provider, {
               filePath: file.path,
@@ -2840,7 +2895,7 @@ const processFileGroup = (
       if (nodeLabel === 'Property' && definitionNode) {
         // FieldExtractor is the single source of truth when available
         if (provider.fieldExtractor && typeEnv) {
-          const classNode = findEnclosingClassNode(definitionNode);
+          const classNode = findEnclosingClassNodeOrFileOwner(definitionNode, provider, file.path);
           if (classNode) {
             const fieldMap = getFieldInfo(classNode, provider, {
               typeEnv,

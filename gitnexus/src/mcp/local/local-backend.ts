@@ -283,7 +283,12 @@ function normalizeToolParams(
       const value = input[key];
       // Internal CLI callers materialize omitted optional flags as undefined.
       if (value === undefined) continue;
-      if (typeof value !== 'string' || !value.trim()) {
+      // Strict OpenAI/Anthropic adapters also materialize omitted optional
+      // string aliases as "". Treat those exactly like undefined. Required
+      // canonical values are still rejected by the method-specific check
+      // below, and non-string aliases remain invalid.
+      if (typeof value === 'string' && !value.trim()) continue;
+      if (typeof value !== 'string') {
         return { error: `MCP parameter ${method}.${key} must be a non-empty string.` };
       }
       supplied.push({ key, value: value.trim() });
@@ -297,7 +302,7 @@ function normalizeToolParams(
       };
     }
 
-    for (const alias of aliases) delete normalized[alias];
+    for (const key of keys) delete normalized[key];
     if (supplied.length > 0) normalized[canonical] = supplied[0].value;
   }
 
@@ -477,6 +482,8 @@ interface ImpactFrontierEdge {
   confidence: unknown;
   /** `n.id` — the frontier node this edge was reached FROM. */
   sourceId: string;
+  /** Edge sits in a branch proven dead at index time (`GraphRelationship.staticGated`). */
+  staticGated?: boolean;
 }
 
 /**
@@ -988,6 +995,9 @@ export function buildDetectChangesDiffArgs(scope: string, baseRef?: string): str
     'diff',
     '--ignore-cr-at-eol',
     '--no-ext-diff',
+    // color.ui=always prefixes `+++ b/` with ANSI, so parseDiffHunks sees zero
+    // files and the CLI used to print a clean "No changes detected." (#3131).
+    '--color=never',
     '--src-prefix=a/',
     '--dst-prefix=b/',
   ];
@@ -7415,8 +7425,8 @@ export class LocalBackend {
       // tool. `sourceId` closes the order for edges that tie on both.
       const query =
         direction === 'upstream'
-          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
-          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
+          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence, r.staticGated AS staticGated`
+          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence, r.staticGated AS staticGated`;
 
       try {
         const related = await executeParameterized(repo.lbugPath, query, {
@@ -7433,6 +7443,9 @@ export class LocalBackend {
           relType: rel.relType || rel[5],
           confidence: rel.confidence ?? rel[6],
           sourceId: String(rel.sourceId ?? rel[0] ?? ''),
+          // Set only by languages that compute static gating (Zig); null/undefined
+          // from older indexes or other languages reads as live.
+          ...((rel.staticGated ?? rel[7]) === true ? { staticGated: true } : {}),
         }));
 
         // The pdg bridge is the ONE consumer here that accumulates sequentially
@@ -7514,6 +7527,9 @@ export class LocalBackend {
             filePath: edge.filePath,
             relationType,
             confidence: effectiveConfidence,
+            // Surfaced, never acted on: traversal and ranking ignore the flag
+            // (see GraphRelationship.staticGated). Absent = live or unmodelled.
+            ...(edge.staticGated === true ? { staticGated: true } : {}),
           });
         }
       } catch (e) {

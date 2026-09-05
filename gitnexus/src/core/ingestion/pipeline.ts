@@ -74,6 +74,20 @@ export interface PipelineOptions {
   springActuatorPath?: string;
   /** Repo-relative Actuator inputs retained only for a cleanup scan. */
   springActuatorScanExclusions?: readonly string[];
+  /**
+   * Explicit local AsyncAPI 3.x document input, read by the `springDestinations`
+   * phase. Accepts a directory of documents or a single document; the path is
+   * resolved against the repository root, so a committed `docs/asyncapi` and an
+   * absolute cache populated out of band are equally natural. Undefined keeps
+   * specification reading completely disabled.
+   *
+   * There is deliberately no glob-based auto-discovery to go with it. Scanning
+   * a repository for anything that parses as a document would make every
+   * existing index grow destination nodes on its next run without an operator
+   * having decided anything — the same reason new contract extractors ship
+   * opt-in rather than on.
+   */
+  asyncApiSpecPath?: string;
   /** Per-advice Spring AOP candidate inspection cap. `0` disables this cap. */
   springAopMaxCandidateInspectionsPerAdvice?: number;
   /** Aggregate Spring AOP candidate inspection cap for one analysis. `0` disables this cap. */
@@ -397,13 +411,19 @@ export const runPipelineFromRepo = async (
   }
 
   // Extract final results for the PipelineResult contract
-  const { totalFiles, usedWorkerPool, reparsedFileCount, unavailableScopeLanguageFiles } =
-    getPhaseOutput<{
-      totalFiles: number;
-      usedWorkerPool: boolean;
-      reparsedFileCount: number;
-      unavailableScopeLanguageFiles: number;
-    }>(results, 'parse');
+  const {
+    totalFiles,
+    usedWorkerPool,
+    reparsedFileCount,
+    parseCacheHitFileCount,
+    unavailableScopeLanguageFiles,
+  } = getPhaseOutput<{
+    totalFiles: number;
+    usedWorkerPool: boolean;
+    reparsedFileCount: number;
+    parseCacheHitFileCount: number;
+    unavailableScopeLanguageFiles: number;
+  }>(results, 'parse');
 
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
@@ -456,6 +476,7 @@ export const runPipelineFromRepo = async (
     undecidedSatisfaction,
     usedWorkerPool,
     reparsedFileCount,
+    parseCacheHitFileCount,
     scopeExtractionFailures,
     unavailableScopeLanguageFiles,
     pdgEmitManifest,
