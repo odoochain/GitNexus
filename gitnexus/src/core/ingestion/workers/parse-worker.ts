@@ -11,15 +11,14 @@ import TypeScript from 'tree-sitter-typescript';
 import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
 import CPP from 'tree-sitter-cpp';
-// Explicit subpath import — see parser-loader.ts for rationale (#1013).
-import CSharp from 'tree-sitter-c-sharp/bindings/node/index.js';
+import { getLanguageGrammar } from '../../tree-sitter/parser-loader.js';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
 import { requireVendoredGrammar } from '../../tree-sitter/vendored-grammars.js';
 import { SupportedLanguages } from 'gitnexus-shared';
-import { getProvider } from '../languages/index.js';
+import { getLanguageForFileContent, getProvider } from '../languages/index.js';
 import {
   getTreeSitterBufferSize,
   getTreeSitterContentByteLength,
@@ -29,6 +28,7 @@ import {
   ARRAY_METHOD_HOC_BLOCKLIST_SET,
   DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET,
   deriveDefaultExportHocName,
+  isBlockedCallbackRegistrationCall,
 } from '../ts-js-hoc-utils.js';
 import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
 import type { SkippedPath } from './clone-safety.js';
@@ -44,6 +44,11 @@ import type {
 
 /** Language grammar type accepted by Parser.setLanguage(). */
 type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
+
+// Avoid the upstream C# wrapper's top-level await: terminating a ready worker
+// can race V8's async module completion and abort the process. Reuse the
+// synchronous native loader and node-type metadata used by the main thread.
+const CSharp = getLanguageGrammar(SupportedLanguages.CSharp);
 
 // ── Worker grammar loading — enforcement boundary (#2091/#2093, #2101) ───────
 // The worker maintains its own grammar table (the guarded vendored-grammar
@@ -87,6 +92,11 @@ let Zig: TreeSitterLanguage | null = null;
 try {
   Zig = requireVendoredGrammar('tree-sitter-zig') as TreeSitterLanguage;
 } catch {}
+
+let ObjectiveC: TreeSitterLanguage | null = null;
+try {
+  ObjectiveC = requireVendoredGrammar('tree-sitter-objc') as TreeSitterLanguage;
+} catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
   buildDefinitionPreScan,
@@ -118,7 +128,11 @@ import {
   type SyntaxNode,
 } from '../utils/ast-helpers.js';
 import { isPositionQualifiedLocalLabel } from '../utils/callable-labels.js';
-import { extractCallArgTypes, type MixedChainStep } from '../utils/call-analysis.js';
+import {
+  countCallArguments,
+  extractCallArgTypes,
+  type MixedChainStep,
+} from '../utils/call-analysis.js';
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
@@ -129,6 +143,12 @@ import {
   extractTemplateComponents,
   isVueSetupTopLevel,
 } from '../vue-sfc-extractor.js';
+import {
+  extractNotebookPython,
+  isNotebookPath,
+  mapExtractLine,
+  type NotebookLineSegment,
+} from '../ipynb-extractor.js';
 import type { NodeLabel, ParameterTypeClass } from 'gitnexus-shared';
 import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
 import type { MethodInfo, MethodExtractorContext } from '../method-types.js';
@@ -251,7 +271,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD' | 'HAS_PROPERTY';
+  type: 'DEFINES' | 'DECLARES' | 'HAS_METHOD' | 'HAS_PROPERTY';
   confidence: number;
   reason: string;
 }
@@ -332,6 +352,13 @@ export interface FetchWrapperDef {
   functionName: string;
 }
 
+/** See {@link ExtractedDecoratorRoute.handlerReceiver}. */
+export interface RouteHandlerReceiver {
+  kind: 'type' | 'constructor' | 'module';
+  name?: string;
+  qualifier?: string;
+}
+
 export interface ExtractedDecoratorRoute {
   filePath: string;
   routePath: string;
@@ -377,6 +404,20 @@ export interface ExtractedDecoratorRoute {
    */
   handlerName?: string;
   /**
+   * Static hint for what the receiver of a qualified {@link handlerName}
+   * (`h.Method`, `pkg.Func`) is, read from the registering file's own syntax.
+   * The worker sees one file, so it records only what that file says:
+   *   - `type` — the receiver was declared or built as `name` (`h := &T{}`,
+   *     `var h *T`, a `h *pkg.T` parameter);
+   *   - `constructor` — the receiver was returned by the function `name`
+   *     (`h := NewT(...)`), whose declared result type names the owner;
+   *   - `module` — the receiver is the import `qualifier` (`pkg.Func`).
+   * `qualifier` is the import local name the type or constructor was reached
+   * through, when there is one. Only the route file's provider reads this, via
+   * `LanguageProvider.resolveRouteHandler`; absent when nothing was inferred.
+   */
+  handlerReceiver?: RouteHandlerReceiver;
+  /**
    * Provenance for the `HANDLES_ROUTE` edge, overriding the default
    * `decorator-<decoratorName>`. Present when the route was extracted from a
    * shape that is not a decorator at all — today, JS/TS dispatch guards
@@ -406,6 +447,8 @@ export interface ExtractedToolDef {
   description: string;
   lineNumber: number;
   handlerNodeId?: string;
+  /** Unresolved registrations must not inherit unrelated same-file flows. */
+  allowFileFallback?: false;
 }
 
 export interface ExtractedORMQuery {
@@ -557,6 +600,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Java]: Java,
   ...(C ? { [SupportedLanguages.C]: C } : {}),
   [SupportedLanguages.CPlusPlus]: CPP,
+  ...(ObjectiveC ? { [SupportedLanguages.ObjectiveC]: ObjectiveC } : {}),
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
@@ -1269,7 +1313,7 @@ const processBatch = (
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    const lang = getLanguageForFileContent(file.path, file.content);
     if (!lang) continue;
     let list = byLanguage.get(lang);
     if (!list) {
@@ -1543,6 +1587,10 @@ function reportWarning(message: string): void {
   }
 }
 
+// Keep compiled queries across jobs in this worker. A language can select
+// multiple native grammars, so both grammar identity and query text matter.
+const compiledQueries = new WeakMap<object, Map<string, Parser.Query>>();
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -1553,7 +1601,14 @@ const processFileGroup = (
   let query: Parser.Query;
   try {
     const lang = parser.getLanguage();
-    query = new Parser.Query(lang, queryString);
+    let queries = compiledQueries.get(lang);
+    if (!queries) {
+      queries = new Map();
+      compiledQueries.set(lang, queries);
+    }
+    const cached = queries.get(queryString);
+    query = cached ?? new Parser.Query(lang, queryString);
+    if (!cached) queries.set(queryString, query);
   } catch (err) {
     reportWarning(
       `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1577,21 +1632,52 @@ const processFileGroup = (
     // Vue SFC preprocessing: extract <script> block content
     let parseContent = file.content;
     let scopeSourceKind: ScopeCaptureSourceKind = 'full-file';
+    let scriptLanguage: string | undefined;
     let lineOffset = 0;
+    let sourceLineMap: readonly number[] | undefined;
     let isVueSetup = false;
+    let notebookSegments: readonly NotebookLineSegment[] | undefined;
+    const mapRow = (row: number): number =>
+      notebookSegments
+        ? mapExtractLine(row, notebookSegments)
+        : (sourceLineMap?.[row] ?? row + lineOffset);
     if (language === SupportedLanguages.Vue) {
       const extracted = extractVueScript(file.content);
       if (!extracted) continue; // skip .vue files with no script block
       parseContent = extracted.scriptContent;
       scopeSourceKind = 'pre-extracted-script';
       lineOffset = extracted.lineOffset;
+      sourceLineMap = extracted.sourceLineMap;
+      scriptLanguage = extracted.lang;
       isVueSetup = extracted.isSetup;
+    } else if (language === SupportedLanguages.Python && isNotebookPath(file.path)) {
+      const extracted = extractNotebookPython(file.content);
+      if (!extracted) continue;
+      parseContent = extracted.pythonSource;
+      scopeSourceKind = 'pre-extracted-script';
+      notebookSegments = extracted.segments;
     }
 
     // Per-language source-text transform (e.g., UE macro stripping for C++).
     // Length-preserving — see LanguageProvider.preprocessSource contract.
     parseContent =
       getProvider(language).preprocessSource?.(parseContent, file.path) ?? parseContent;
+
+    const embeddedGrammar =
+      scriptLanguage !== undefined
+        ? getProvider(language).selectEmbeddedGrammar?.(scriptLanguage)
+        : undefined;
+    if (embeddedGrammar && parser.getLanguage() !== embeddedGrammar) {
+      parser.setLanguage(embeddedGrammar);
+      let queries = compiledQueries.get(embeddedGrammar);
+      if (!queries) {
+        queries = new Map();
+        compiledQueries.set(embeddedGrammar, queries);
+      }
+      const cached = queries.get(queryString);
+      query = cached ?? new Parser.Query(embeddedGrammar, queryString);
+      if (!cached) queries.set(queryString, query);
+    }
 
     clearCaches(); // Reset memoization before each new file
 
@@ -1631,6 +1717,7 @@ const processFileGroup = (
     // node id → graph node id for classes THIS file's capture loop materialized.
     // Keyed by in-memory AST identity (never persisted); filled below.
     const classOwnersByNodeId = new Map<number, string>();
+    const callableBindings = new Map<number, string>();
 
     // #2687: ONE pass over `matches` yields both suppression sets — the
     // definition-name claims by rank (callable > Property > value), so the dedup
@@ -1658,6 +1745,10 @@ const processFileGroup = (
       },
       tree,
       scopeSourceKind,
+      notebookSegments,
+      lineOffset,
+      scriptLanguage,
+      sourceLineMap,
     );
     if (scopeExtractionFailed) (result.scopeExtractionFailures ??= []).push(file.path);
     if (parsedFile !== undefined) {
@@ -1704,6 +1795,8 @@ const processFileGroup = (
             // `lineOffset` in the file — shift the CFG into file coordinates so
             // it joins its graph node and BasicBlock lines map to source.
             lineOffset,
+            notebookSegments || sourceLineMap ? mapRow : undefined,
+            sourceLineMap ? 'parse-buffer' : 'source',
           );
           if (cfgs.length) withChannels = { ...withChannels, cfgSideChannel: cfgs };
           // Surface per-function CFG skips per-language (#2195): merged + logged
@@ -1726,6 +1819,52 @@ const processFileGroup = (
       }
 
       result.parsedFiles.push(withChannels);
+    }
+
+    const semanticGraph = provider.extractSemanticGraph?.(tree, file.path, parseContent);
+    if (semanticGraph !== undefined) {
+      for (const node of semanticGraph.nodes) {
+        result.nodes.push({
+          id: node.id,
+          label: node.label,
+          properties: { ...node.properties },
+        });
+      }
+      for (const relationship of semanticGraph.relationships) {
+        if (
+          relationship.type === 'DECLARES' ||
+          relationship.type === 'DEFINES' ||
+          relationship.type === 'HAS_METHOD' ||
+          relationship.type === 'HAS_PROPERTY'
+        ) {
+          result.relationships.push({ ...relationship, type: relationship.type });
+        }
+      }
+      for (const symbol of semanticGraph.symbols) {
+        result.symbols.push({
+          filePath: symbol.filePath,
+          name: symbol.name,
+          nodeId: symbol.nodeId,
+          type: symbol.type,
+          ...(symbol.qualifiedName !== undefined ? { qualifiedName: symbol.qualifiedName } : {}),
+          ...(symbol.parameterCount !== undefined ? { parameterCount: symbol.parameterCount } : {}),
+          ...(symbol.requiredParameterCount !== undefined
+            ? { requiredParameterCount: symbol.requiredParameterCount }
+            : {}),
+          ...(symbol.parameterTypes !== undefined
+            ? { parameterTypes: [...symbol.parameterTypes] }
+            : {}),
+          ...(symbol.parameterTypeClasses !== undefined
+            ? { parameterTypeClasses: [...symbol.parameterTypeClasses] }
+            : {}),
+          ...(symbol.returnType !== undefined ? { returnType: symbol.returnType } : {}),
+          ...(symbol.declaredType !== undefined ? { declaredType: symbol.declaredType } : {}),
+          ...(symbol.ownerId !== undefined ? { ownerId: symbol.ownerId } : {}),
+          ...(symbol.visibility !== undefined ? { visibility: symbol.visibility } : {}),
+          ...(symbol.isStatic !== undefined ? { isStatic: symbol.isStatic } : {}),
+          ...(symbol.isReadonly !== undefined ? { isReadonly: symbol.isReadonly } : {}),
+        });
+      }
     }
 
     // Build per-file type environment + constructor bindings in a single AST walk.
@@ -1814,7 +1953,7 @@ const processFileGroup = (
             sourceId: srcId,
             receiverText,
             propertyName,
-            line: captureMap['assignment'].startPosition.row + 1,
+            line: mapRow(captureMap['assignment'].startPosition.row) + 1,
             ...(receiverTypeName ? { receiverTypeName } : {}),
           });
         }
@@ -1849,7 +1988,7 @@ const processFileGroup = (
             filePath: file.path,
             httpMethod,
             decoratorName,
-            lineNumber: decoratorNode.startPosition.row + lineOffset,
+            lineNumber: mapRow(decoratorNode.startPosition.row),
             ...(decoratorReceiver ? { decoratorReceiver } : {}),
             ...(handlerName ? { handlerName } : {}),
           };
@@ -1937,6 +2076,10 @@ const processFileGroup = (
           // HTTP client calls like axios.get('/api/users') that match the same pattern
           // as Express route registrations.
           const callNode = captureMap['express_route'];
+          // route(path) returns a builder; verb registrations need a handler.
+          // Count arguments without comments, which are also named AST children.
+          const minimumArguments = method === 'route' ? 1 : 2;
+          if ((countCallArguments(callNode) ?? 0) < minimumArguments) continue;
           const funcNode = callNode.childForFieldName?.('function') ?? callNode.children?.[0];
           // Walk through nested member_expressions and call_expressions to
           // reach the innermost receiver identifier.  Handles chains like:
@@ -1974,17 +2117,49 @@ const processFileGroup = (
             continue;
           }
 
-          const httpMethod =
-            method === 'all' || method === 'use' || method === 'route'
-              ? 'GET'
-              : method.toUpperCase();
-          result.decoratorRoutes.push({
-            filePath: file.path,
-            routePath,
-            httpMethod,
-            decoratorName: `express.${method}`,
-            lineNumber: captureMap['express_route'].startPosition.row + lineOffset,
-          });
+          const registrations: { method: string; node: SyntaxNode }[] = [];
+          if (method === 'route') {
+            // A builder alone registers nothing. Follow only direct chained
+            // verb calls, each of which must supply a non-comment handler arg.
+            let builderNode = callNode;
+            while (builderNode.parent?.type === 'member_expression') {
+              const member = builderNode.parent;
+              const registration = member.parent;
+              const verb = member.childForFieldName('property')?.text;
+              if (
+                member.childForFieldName('object')?.id !== builderNode.id ||
+                registration?.type !== 'call_expression' ||
+                registration.childForFieldName('function')?.id !== member.id ||
+                !verb ||
+                !EXPRESS_ROUTE_METHODS.has(verb) ||
+                verb === 'route' ||
+                verb === 'use'
+              ) {
+                break;
+              }
+              if ((countCallArguments(registration) ?? 0) >= 1) {
+                registrations.push({ method: verb, node: registration });
+              }
+              builderNode = registration;
+            }
+          } else {
+            registrations.push({ method, node: callNode });
+          }
+          for (const registration of registrations) {
+            const httpMethod =
+              registration.method === 'all'
+                ? '*'
+                : registration.method === 'use'
+                  ? 'GET'
+                  : registration.method.toUpperCase();
+            result.decoratorRoutes.push({
+              filePath: file.path,
+              routePath,
+              httpMethod,
+              decoratorName: `express.${registration.method}`,
+              lineNumber: registration.node.startPosition.row + lineOffset,
+            });
+          }
         }
         continue;
       }
@@ -2235,6 +2410,18 @@ const processFileGroup = (
       if (!defaultNodeLabel) continue;
       if (provider.shouldSkipDefinitionCapture?.(captureMap, defaultNodeLabel) === true) continue;
 
+      // `{ timer: setTimeout(() => …, 100) }` registers a timer, not a
+      // Function — the TSQ-path twin of the emit-side gate in
+      // languages/*/captures.ts (the query-level `#not-any-of?` predicate
+      // is unreliable: node-tree-sitter 0.21 shares `stringValues` across
+      // `#any-of?` predicates of a compiled query).
+      if (
+        definitionNode?.type === 'pair' &&
+        isBlockedCallbackRegistrationCall(definitionNode.childForFieldName('value'))
+      ) {
+        continue;
+      }
+
       const nameNode = captureMap['name'];
       const extractedClassSymbol =
         definitionNode && provider.classExtractor?.isTypeDeclaration(definitionNode)
@@ -2407,10 +2594,10 @@ const processFileGroup = (
           : definitionNode?.startPosition;
       const startLine =
         startPosition !== undefined
-          ? startPosition.row + lineOffset
+          ? mapRow(startPosition.row)
           : nameNode
-            ? nameNode.startPosition.row + lineOffset
-            : lineOffset;
+            ? mapRow(nameNode.startPosition.row)
+            : mapRow(0);
       const startColumn = startPosition?.column ?? nameNode?.startPosition.column ?? 0;
 
       // Compute enclosing class BEFORE node ID — needed to qualify method IDs
@@ -2734,15 +2921,23 @@ const processFileGroup = (
         }
       }
 
-      // Append #<paramCount> to owned callable IDs to disambiguate overloads.
-      // Top-level Function IDs stay stable; functions inside an owner may overload.
+      // Providers opt free functions into the same signature identity scheme
+      // used by owned callables. A signature stays stable when overloads are added.
+      const freeFunctionOverloads =
+        nodeLabel === 'Function' &&
+        enclosingClassId === null &&
+        provider.overloadsFreeFunctions === true;
       // When same-arity collisions exist, append ~type1,type2 for further disambiguation.
       const needsAritySuffix =
         nodeLabel === 'Method' ||
         nodeLabel === 'Constructor' ||
-        (nodeLabel === 'Function' && enclosingClassId !== null);
+        (nodeLabel === 'Function' && enclosingClassId !== null) ||
+        freeFunctionOverloads;
       let arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
-      if (arityTag && defMethodMap && defMethodInfo) {
+      if (freeFunctionOverloads) {
+        const parameterTypes = methodProps.parameterTypes as string[] | undefined;
+        if (parameterTypes?.length) arityTag += `~${parameterTypes.join(',')}`;
+      } else if (arityTag && defMethodMap && defMethodInfo) {
         const groups = buildCollisionGroups(defMethodMap);
         arityTag += typeTagForId(
           defMethodMap,
@@ -2882,7 +3077,7 @@ const processFileGroup = (
                 filePath: file.path,
                 toolName: nodeName,
                 description: (dec.arg || description || '').slice(0, 200),
-                lineNumber: definitionNode.startPosition.row + lineOffset,
+                lineNumber: mapRow(definitionNode.startPosition.row),
                 handlerNodeId: nodeId,
               });
             }
@@ -2987,7 +3182,7 @@ const processFileGroup = (
           (objectLiteralBindingInfo?.ownerName || isArrayContainedObjectCallable)
             ? { startColumn }
             : {}),
-          endLine: definitionNode ? definitionNode.endPosition.row + lineOffset : startLine,
+          endLine: definitionNode ? mapRow(definitionNode.endPosition.row) : startLine,
           language: language,
           isExported,
           ...(qualifiedTypeName !== undefined ? { qualifiedName: qualifiedTypeName } : {}),
@@ -3008,6 +3203,11 @@ const processFileGroup = (
           ...(returnShapeProperty ? { fromReturnShape: true, isDetail: true } : {}),
         }),
       });
+
+      // Keep actual emitted identities; providers must not reconstruct graph IDs.
+      if (nameNode && (nodeLabel === 'Function' || nodeLabel === 'Method')) {
+        callableBindings.set(nameNode.id, nodeId);
+      }
 
       // enclosingClassId already computed above (before nodeId generation)
       const ownerId = enclosingClassId ?? objectLiteralOwnerInfo?.ownerId;
@@ -3111,10 +3311,34 @@ const processFileGroup = (
       }
     }
 
+    if (provider.extractToolDefinitions) {
+      // Distinct lexical declarations can share a graph ID (for example, sibling
+      // block-scoped functions). Such IDs cannot prove which handler owns a tool.
+      const seenCallableIds = new Set<string>();
+      const ambiguousCallableIds = new Set<string>();
+      for (const nodeId of callableBindings.values()) {
+        if (seenCallableIds.has(nodeId)) ambiguousCallableIds.add(nodeId);
+        seenCallableIds.add(nodeId);
+      }
+      for (const [bindingId, nodeId] of callableBindings) {
+        if (ambiguousCallableIds.has(nodeId)) callableBindings.delete(bindingId);
+      }
+      result.toolDefs.push(
+        ...provider.extractToolDefinitions(tree, file.path, lineOffset, callableBindings),
+      );
+    }
+
     // Extract framework routes via provider detection (e.g., Laravel routes.php)
     if (provider.isRouteFile?.(file.path)) {
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       for (const r of extractedRoutes) result.routes.push(r);
+    }
+
+    // Content-based route extraction via provider hook (path-gate lives on
+    // the provider; the worker does not name languages or frameworks).
+    if (provider.extractTextRoutes) {
+      const textRoutes = provider.extractTextRoutes(file.path, file.content);
+      for (const r of textRoutes) result.routes.push(r);
     }
 
     // Extract ORM queries (Prisma, Supabase)

@@ -16,6 +16,9 @@ import { detectGoInterfaceImplementations } from './interface-impls.js';
 import { populateGoRangeBindings } from './range-binding.js';
 import { expandGoWildcardNames } from './expand-wildcards.js';
 import { goMapValueType } from './interpret.js';
+import { goIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { goIsNamespaceMemberVisible } from './namespace-member-visibility.js';
+import { resolveGoImportBinding } from './import-binding.js';
 
 /** Slice `[]T` and array `[N]T` / `[...]T` → the element spelling. Hoisted —
  *  a literal inside the hook would mint a fresh RegExp per folded subscript. */
@@ -30,6 +33,8 @@ export const goScopeResolver: ScopeResolver = {
 
   resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) =>
     resolveGoImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+
+  resolveImportBinding: resolveGoImportBinding,
 
   expandsWildcardTo: (targetModuleScope, parsedFiles) =>
     expandGoWildcardNames(targetModuleScope, parsedFiles),
@@ -85,6 +90,8 @@ export const goScopeResolver: ScopeResolver = {
   hoistTypeBindingsToModule: true,
   propagatesReturnTypesAcrossImports: true,
   allowGlobalFreeCallFallback: true,
+  isGlobalNameFallbackPlausible: goIsGlobalNameFallbackPlausible,
+  isNamespaceMemberVisible: goIsNamespaceMemberVisible,
 
   populateNamespaceSiblings: populateGoPackageSiblings,
   mirrorNamespaceTypeBindings: mirrorGoNamespaceTypeBindings,

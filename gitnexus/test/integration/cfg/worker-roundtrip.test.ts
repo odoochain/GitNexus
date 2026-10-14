@@ -28,17 +28,18 @@ const tsVisitor = (): CfgVisitor<SyntaxNode> => {
   return v;
 };
 
-describe('CFG provider gate — a cfgVisitor enables the worker CFG path', () => {
-  it('TS and JS providers carry a cfgVisitor', () => {
-    expect(getProvider(SupportedLanguages.TypeScript).cfgVisitor).toBeDefined();
-    expect(getProvider(SupportedLanguages.JavaScript).cfgVisitor).toBeDefined();
-  });
+describe('CFG provider gate', () => {
+  it.each(Object.values(SupportedLanguages))(
+    '%s provides AST or source-backed flow extraction',
+    (language) => {
+      const provider = getProvider(language);
+      expect(provider.cfgVisitor ?? provider.collectSourceCfgs).toBeDefined();
+    },
+  );
 
-  it('a non-CFG language (COBOL) has no cfgVisitor ⇒ worker emits no cfgSideChannel', () => {
-    // `provider.cfgVisitor &&` short-circuits in the worker → no CFG, no field.
-    // COBOL is the deliberate non-goal of the PDG-language rollout (#2195) —
-    // every other supported language now carries a cfgVisitor.
+  it('standalone source extraction does not require a synthetic tree visitor', () => {
     expect(getProvider(SupportedLanguages.Cobol).cfgVisitor).toBeUndefined();
+    expect(getProvider(SupportedLanguages.Cobol).collectSourceCfgs).toBeTypeOf('function');
   });
 });
 
@@ -353,7 +354,7 @@ describe('#2083 M3 U1 — pdg chunk-key namespace version (flag-off keys untouch
     );
   });
 
-  it('pdg-mode keys CHANGED from prior namespaces AND pin the current pdg:5 (FU-C BindingEntry.formalIndex)', () => {
+  it('pdg-mode keys CHANGED from prior namespaces AND pin the current pdg:6 (embedded call anchors)', () => {
     // The pdg namespace bumps whenever the worker `cfgSideChannel` SHAPE changes:
     // U1 added `SiteRecord.at` (pdg:2→3), U4 added the Rust struct-literal
     // `kind:'new'` site (pdg:3→4), and the FU-C call-summary soundness fix added
@@ -361,8 +362,9 @@ describe('#2083 M3 U1 — pdg chunk-key namespace version (flag-off keys untouch
     // the enclosing formal position, not the flattened binding ordinal. A stale
     // prior shard lacks the new field, so the call-summary harvest would route to
     // its conservative empty-summary fallback on a warm cache. Assert prior chunks
-    // are NOT served, and PIN the current pdg:5 namespace so an accidental revert
+    // are NOT served, and PIN the current pdg:6 namespace so an accidental revert
     // of the token re-introduces the stale-shape bug.
+    // pdg:5→6 restores embedded parse-buffer call anchors for the callee-id join.
     const joined = 'a.ts:h1\nb.ts:h2';
     const keyOf = (token: string) =>
       createHash('sha256')
@@ -372,6 +374,7 @@ describe('#2083 M3 U1 — pdg chunk-key namespace version (flag-off keys untouch
     expect(current).not.toBe(keyOf('pdg:2'));
     expect(current).not.toBe(keyOf('pdg:3'));
     expect(current).not.toBe(keyOf('pdg:4'));
-    expect(current).toBe(keyOf('pdg:5'));
+    expect(current).not.toBe(keyOf('pdg:5'));
+    expect(current).toBe(keyOf('pdg:6'));
   });
 });

@@ -1,5 +1,62 @@
 # Receiver-resolution baseline
 
+## Semantic rename provider captures (#3486)
+
+A same-corpus A/B against `origin/main` (`191a954b`) reproduced the committed
+129 call / 167 all-kind drops. The final provider source and rebuilt workers
+measure 127 call / 189 all-kind drops, including 43 reads and 19 writes. The
+original runner and a separate one-worker diagnostic agree exactly on every
+gated count; all shape-arm states are unchanged.
+
+The two removed call drops are `user.address.save` in
+`ruby-field-type-disambig/service.rb:7` and `ruby-field-types/service.rb:6`.
+Preserving the `./` distinction for bare `require_relative` paths resolves the
+fixture imports. Both sites now emit `CALLS` to their own fixture's
+`Address.save`, with no edge to the same-named `User.save`. Ruby call drops fall
+from 2 to 0, `chain-call` from 32 to 30, and `in-program` from 56 to 54; every
+other call bucket is unchanged.
+
+The 24 added drops are newly captured Zig field reads, rather than lost call
+edges. The Zig `field_expression` query now records complete receivers for
+reads outside call/argument positions; its callee-position marker lets resolved
+method reads avoid phantom edges. Every added suppressed site has exactly one
+new `@reference.read` capture at the same written range and no corresponding
+capture on `origin/main`. Existing suppressed read sites retain their ranges
+and acquire receiver-chain metadata. These newly visible unresolved reads stay
+in the exact all-kind gate; no coverage or threshold is relaxed.
+
+## Python mixin dispatch (#3390)
+
+The added mixin fixture deliberately calls an absent `missing_target` on a known
+in-program receiver. The resolver now records that unresolved call rather than
+silently treating missing edges as complete coverage. The focused Python resolver
+test asserts this outcome. CI run 36319863343 at `4034cee` measured one additional
+Python call drop (113 to 114; all-kind total 159 to 160), classified as in-program
+with no receiver-shape annotation. No shape-arm result or performance threshold
+changed. The renamed bound-receiver correction preserves the existing method's
+effective arity. The measurements below supersede this earlier snapshot.
+
+The final #3390 head did not retain that snapshot: its full corpus measured 125
+call drops, including 12 in the new mixin fixture. At #3393 head, C3 resolves
+`order_hook` to `OrderX.order_hook`, removing that fixture's one ambiguous drop.
+The full corpus now measures 124 call drops (16 Python, 54 in-program), with 11
+from the mixin fixture. The ten fixture outcomes missing from the old baseline
+are three `helper()` calls with valid targets and an unproven variadic sibling,
+field shadowing, three incompatible argument shapes, private-name lookup, an
+abstract declaration, and duplicate definitions. The integration test pins
+their exact call sites; none of these ten is the C3 `order_hook` call. These
+counts track conservative unresolved coverage, including partial fan-out, not
+only calls with no emitted edge.
+
+The Python capture fingerprint is also intentionally regenerated: ordinary call
+captures now include statically known argument counts, the corpus includes eight
+new mixin fixture files, and bound method parameter counts exclude receivers by
+class/decorator context rather than spelling. Unknown splat cardinalities remain
+unknown. The final deterministic corpus contains 213 entries and 3,463 capture
+groups. The golden test pins each fixture; only the mixin and renamed target
+digests changed in the bound-receiver delta, with their group counts unchanged.
+Scaling limits and all non-Python capture baselines remain unchanged.
+
 > **`baseline.json` is the source of truth for every number.** It is what
 > `measure.mjs --check` enforces byte-exactly. This file is a lab notebook:
 > each section records what was measured AT THAT UNIT and why it changed the

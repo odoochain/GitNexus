@@ -13,6 +13,7 @@
  * reproduce the outage exactly.
  */
 
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   shardFiles,
@@ -20,15 +21,68 @@ import {
   weightOf,
   WINDOWS_WEIGHTS_SEC,
 } from '../../scripts/cross-platform-shard.js';
-import { ALL_CROSS_PLATFORM } from '../../scripts/cross-platform-tests.js';
+import { ALL_CROSS_PLATFORM, WORKER_THREADS } from '../../scripts/cross-platform-tests.js';
 
-const SHARD_TOTAL = 3;
+// Replay the actual CI partition, including shard-count changes as the suite grows.
+const workflow = readFileSync(
+  new URL('../../../.github/workflows/ci-tests.yml', import.meta.url),
+  'utf8',
+);
+const SHARD_TOTAL = Number(workflow.match(/^\s+TOTAL=(\d+)\b/m)?.[1]);
 
 /** Every shard of a split, as file lists. */
 const allShards = (files: readonly string[], total: number): readonly (readonly string[])[] =>
   Array.from({ length: total }, (_unused, i) => shardFiles(files, i + 1, total));
 
 describe('cross-platform shard partition', () => {
+  it('selects both real-worker local-import proofs exactly once across the CI shards', () => {
+    const proofs = [
+      'test/integration/local-import-worker-parity.test.ts',
+      'test/integration/resolvers/local-import-persistence.test.ts',
+    ];
+    const selected = allShards(ALL_CROSS_PLATFORM, SHARD_TOTAL).flat();
+    for (const file of proofs) {
+      expect(WORKER_THREADS.filter((candidate) => candidate === file)).toEqual([file]);
+      expect(ALL_CROSS_PLATFORM.filter((candidate) => candidate === file)).toEqual([file]);
+      expect(selected.filter((candidate) => candidate === file)).toEqual([file]);
+    }
+  });
+
+  it('does not recreate the overloaded Windows shard from the #3190 CI run', () => {
+    // Run 34014266125: these serialized DB suites were missing or undercharged
+    // in the scheduling table. Keep the observed profile independent of the
+    // table so deleting a weight cannot make this regression pass again.
+    const observed: Readonly<Record<string, number>> = {
+      'test/integration/skills-e2e.test.ts': 550,
+      'test/unit/incremental-index-extension-dml-gate.test.ts': 414,
+      'test/integration/fts-extension-e2e.test.ts': 380,
+      'test/integration/analyze-wal-checkpoint-failure.test.ts': 86,
+      'test/integration/skip-fts.test.ts': 110,
+    };
+    const floor = weightOf('test/unmeasured.test.ts');
+    const loads = allShards(ALL_CROSS_PLATFORM, SHARD_TOTAL).map((files) =>
+      files.reduce((sum, file) => sum + Math.max(weightOf(file), (observed[file] ?? 0) + floor), 0),
+    );
+    // This is a deterministic replay of recorded weights, not a timing test.
+    // The runner's existing watchdog remains 20 minutes.
+    expect(Math.max(...loads)).toBeLessThan(20 * 60);
+    const shards = allShards(ALL_CROSS_PLATFORM, SHARD_TOTAL);
+    const heavyweightLocations = [
+      'test/integration/cli-e2e.test.ts',
+      'test/integration/skills-e2e.test.ts',
+      'test/unit/incremental-index-extension-dml-gate.test.ts',
+    ].map((file) => shards.findIndex((files) => files.includes(file)));
+    expect(heavyweightLocations).not.toContain(-1);
+    expect(new Set(heavyweightLocations).size).toBe(heavyweightLocations.length);
+    expect(
+      shards.filter(
+        (s) =>
+          s.includes('test/integration/skills-e2e.test.ts') &&
+          s.includes('test/integration/fts-extension-e2e.test.ts'),
+      ),
+    ).toEqual([]);
+  });
+
   it('covers every file exactly once, with no overlap between shards', () => {
     const shards = allShards(ALL_CROSS_PLATFORM, SHARD_TOTAL);
     const seen = shards.flatMap((s) => [...s]);
@@ -48,7 +102,7 @@ describe('cross-platform shard partition', () => {
     expect(Math.max(...weights)).toBeLessThanOrEqual(ideal * 1.34);
   });
 
-  it('never puts the two heaviest suites on the same shard', () => {
+  it('keeps the CLI and worker-pool suites on different shards', () => {
     // The exact shape of the outage: cli-e2e and worker-pool are 621 s and
     // 222 s, so together they are most of a shard's budget before anything else
     // is scheduled.

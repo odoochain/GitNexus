@@ -24,7 +24,7 @@ Monorepo: **CLI/MCP** (`gitnexus/`) + **browser UI** (`gitnexus-web/`).
    - **HTTP bridge:** `serve.ts` → Express (`api.ts`, `mcp-http.ts`) for web UI
    - **CLI direct:** `gitnexus query|context|impact|cypher` in `tool.ts`
 
-4. **Staleness** — `staleness.ts` compares indexed `lastCommit` to `HEAD`, surfaces hints.
+4. **Staleness** — `core/git-staleness.ts` compares indexed `lastCommit` to `HEAD` and classifies the result as `current`, `behind`, `diverged` (HEAD moved off the indexed commit, gap uncountable) or `unknown`; `core/staleness-status.ts` builds the one `staleness` payload that MCP `list_repos`, the read tools and the `serve` repo routes all emit.
 
 ## MCP tools
 
@@ -36,7 +36,7 @@ Monorepo: **CLI/MCP** (`gitnexus/`) + **browser UI** (`gitnexus-web/`).
 | `context`        | Callers, callees, processes for one symbol                                                                                     |
 | `impact`         | Blast radius (upstream/downstream) with risk summary                                                                           |
 | `detect_changes` | Map git diffs to affected symbols and processes                                                                                |
-| `rename`         | Graph-assisted multi-file rename with `dry_run` preview                                                                        |
+| `rename`         | Semantic rename: previews by default (`dry_run` omitted/true), applies with `dry_run: false`                                   |
 | `api_impact`     | Pre-change impact report for an API route handler                                                                              |
 | `trace`          | Shortest directed path between two symbols (call + class-member edges); group-aware (`repo: "@<group>"`) for cross-repo traces |
 | `route_map`      | API route → handler → consumer mappings                                                                                        |
@@ -276,6 +276,14 @@ Language-agnostic scope-resolution resolver. This is the resolution path for eve
 Orchestrator: `runScopeResolution(input, provider)` in `scope-resolution/pipeline/run.ts`.
 Pipeline phase: `scopeResolutionPhase` in `scope-resolution/pipeline/phase.ts` — iterates the registered `SCOPE_RESOLVERS` over the worker-serialized `ParsedFile`s. (Per-language `emitScopeCaptures` hooks may reuse a cached Tree via the orchestrator's `treeCache`, but in worker-pool runs that cache is empty — Trees can't cross MessageChannels — so they consume the pre-extracted `ParsedFile` instead; § Performance notes.)
 
+### Semantic rename
+
+`rename` plans through the graph-backed planner in `mcp/local/rename/graph-rename.ts`; `dry_run` (omitted or `true`) stops after planning, `dry_run: false` also applies. In MCP read-only mode the same tool is listed preview-only and any other `dry_run` is rejected before backend dispatch (`mcp/read-only-policy.ts`). The selected graph declaration must match the current source. Each language's `LanguageProvider.rename` supplies original-source name spans, spelling rules, declaration families, and syntax-specific rewrites. Embedded and standalone providers retain their own parsing strategy; shared planning does not classify language syntax or invoke compiler/language-service APIs.
+
+The planner runs the existing scope-resolution pipeline before and after the proposed edits. An opt-in source-binding observer records the declaration selected for a written name, separately from runtime dispatch expansion. Provider capture metadata travels with each parsed file, so both passes retain ordinary import and ownership evidence. Provider-proven declaration families use the existing inheritance, implementation, and declaration relationships. Re-resolution checks edited references, untouched bindings, collisions, and changes in those families.
+
+Application validates all captured source snapshots before each per-file replacement, then rechecks that destination immediately before installing it. Validation and replacement are separate filesystem operations; the operation is neither an atomic compare-and-swap nor a multi-file transaction. Unsupported or ambiguous source constructs produce an explicit blocked result. Coverage is limited to the indexed workspace and the provider's available semantic evidence; dynamic names and external consumers are not silently treated as resolved.
+
 ### Callable-value flow
 
 First-class callable values use a language-neutral inclusion analysis in `passes/callable-value-flow.ts`. Providers recognize their own syntax and emit JSON-safe `CallableFlowSite` facts (`seed`, `copy`, `alias`, `address`, `load`, `store`, `formal`, `argument`, and `invoke`) into `ParsedFile`; shared ingestion never branches on a language name. These always-on facts cross workers and the durable parse store, whose schema is bumped whenever their semantic shape changes.
@@ -304,7 +312,9 @@ Receivers the resolver could not type are not silently dropped. Each records a `
 
 ### Optional CFG/PDG emission (`--pdg`, #2081–#2086)
 
-On a `--pdg` run the parse worker builds a per-function control-flow graph from the tree-sitter AST (`LanguageProvider.cfgVisitor`; TypeScript/JavaScript today) and serializes it onto `ParsedFile.cfgSideChannel` as plain data. Scope-resolution then emits the program-dependence layers from that side-channel **inside Phase 4 of `runScopeResolution`, while the disk-backed ParsedFile store is still live** — the only window where the worker-built CFGs are loaded (the store is cleared right after the phase returns). A standalone post-`mro` phase would read an empty store, so the emit deliberately lives in-phase, mirroring the `applyCaptureSideChannel` pattern. The opt-in is off by default (graph byte-identical), folded into the parse-cache key (a pdg-off warm cache is never reused on a `--pdg` run), and each layer is bounded by a per-function edge cap that logs any dropped edges. All layers are `BasicBlock → BasicBlock` edges in the single `CodeRelation` table, keyed by `type`; there is **no** `Function → BasicBlock` edge — the symbol↔block join is reconstructed from the BasicBlock id prefix + line span. The layers build on each other:
+On a `--pdg` run providers build control-flow graphs through `LanguageProvider.cfgVisitor` (Tree-sitter ASTs) or `collectSourceCfgs` (standalone source processing). Every supported language supplies one of these hooks; Vue covers executable scripts. AST visitors run in the parse worker, while source-backed providers run during fresh scope extraction. Both produce plain `ParsedFile.cfgSideChannel` data. Scope-resolution emits the program-dependence layers **inside Phase 4 of `runScopeResolution`, while the disk-backed ParsedFile store is still live**. The store is cleared after that phase, so a later standalone phase cannot consume it.
+
+The opt-in is off by default, folded into the parse-cache key, and bounded by executable-region and edge caps. Providers report unsupported regions and cap drops instead of fabricating complete flow. All dependence edges remain `BasicBlock → BasicBlock` in the existing `CodeRelation` table. Ordinary function ownership uses the BasicBlock id prefix and source span. A provider may supply an exact graph `ownerId` for a larger executable region; COBOL uses its existing program Module identity so paragraph fallthrough and PERFORM return continuations remain inside one region. This identity is persisted on BasicBlocks and used by PDG symbol projection. No new function-to-block relation is introduced. The layers build on each other:
 
 - **M1 — CFG** (#2081): `BasicBlock` nodes + `CFG` edges. Edge _kind_ (`seq`/`cond-true`/`loop-back`/…) rides the `reason` column (CFG is one `CodeRelation` type, not one per kind).
 - **M2 — REACHING_DEF** (#2082): GEN/KILL def→use data dependence from a pure fixpoint solver; the variable name rides `reason`.
@@ -377,7 +387,7 @@ CI auto-discovers the set via `tsx`. No workflow edit required.
 
 ## Language-agnostic graph feeding
 
-16 languages → single unified graph. Four abstraction layers:
+18 languages → single unified graph. Four abstraction layers:
 
 ```
  Unified Graph Schema (44 node types, 21 relationship types)
@@ -405,7 +415,7 @@ Each language implements `LanguageProvider` (`language-provider.ts`). Key fields
 | `descriptionExtractor` | Optional hook returning a symbol's doc-comment text as its `description`; feeds the embedding metadata header so doc-only terms are semantically searchable (issue #2270). Most languages register `createLeadingDocDescriptionExtractor` (shared, language-neutral; per-language comment/wrapper config passed at the call site) |
 | `definitionPropertiesExtractor` | Optional language-owned hook for structured, clone-safe definition metadata. Shared ingestion persists these properties opaquely; the owning provider supplies the extraction semantics. |
 
-16 providers in `languages/index.ts` via `satisfies Record<SupportedLanguages, LanguageProvider>` — missing a language is a compile error.
+18 providers in `languages/index.ts` via `satisfies Record<SupportedLanguages, LanguageProvider>` — missing a language is a compile error.
 
 ### Unified capture tags
 
@@ -485,13 +495,33 @@ CLI (analyze.ts) → runFullAnalysis(repoPath, options, callbacks)
   ├── lbug.wal       # Write-ahead log
   ├── lbug.shadow    # Shadow sidecar (checkpoint staging)
   ├── lbug.lock      # Single-writer lock
+  ├── lbug.wal.checkpoint, lbug.checkpoint.{intent,apply}.lock  # checkpoint-in-flight artifacts; left behind only by an interrupted checkpoint, consumed by the next writable open
   ├── lbug.{wal,shadow}.dirty-recovery  # parked sidecars from a crashed run; safe to delete
   ├── gitnexus.json  # lastCommit, indexedAt, stats (primary metadata file)
   └── meta.json      # legacy mirror of gitnexus.json, kept in sync (see MIGRATION.md)
 
 ~/.gitnexus/
-  └── registry.json  # Global repo registry (MCP discovery)
+  ├── registry.json  # Global repo registry (MCP discovery)
+  └── stores/<key>/  # Shared sibling index store (see below)
+      ├── caches/                         # parse cache + durable ParsedFile store
+      ├── commits/<commit>-<featureKey>/  # one immutable graph per commit + settings
+      └── checkouts/<slot>/               # one checkout's metadata, membership, and
+                                          # private graph when it has local edits
 ```
+
+The flat `<repo>/.gitnexus/` layout applies to a standalone repository and
+whenever `GITNEXUS_STORAGE_PATH` / `GITNEXUS_STORAGE_ROOT` is set. A repository
+with linked worktrees, and clones with the same `origin` URL, share one
+`stores/<key>/` automatically (a clone opts out with `analyze --no-share`;
+`GITNEXUS_SHARED_STORE=off` turns sharing off entirely). Each sharing checkout
+keeps only a `.gitnexus/store.json` pointer to its store. Path resolution lives
+in `shared-store.ts`.
+
+Read-only opens self-heal an interrupted checkpoint: the refusal is
+classified and cleared by one writable open (probe + `CHECKPOINT`) before
+the read-only open is retried — see `sidecar-recovery.ts`
+(`isReadOnlyCheckpointInProgressError`) and the
+`lbug-interrupted-checkpoint-recovery` integration test.
 
 Managed by `repo-manager.ts`.
 
@@ -542,4 +572,5 @@ Node IDs use arity suffix (`#<paramCount>`): `Method:file:Class.method#1` vs `#2
 - [RUNBOOK.md](RUNBOOK.md) — operational commands and recovery
 - [GUARDRAILS.md](GUARDRAILS.md) — safety boundaries for humans and agents
 - [TESTING.md](TESTING.md) — how to run tests
+- [docs/languages/objective-c-provider.md](docs/languages/objective-c-provider.md) — Objective-C provider behavior and limits
 - `AGENTS.md` / `CLAUDE.md` — agent workflows and tool usage

@@ -36,6 +36,7 @@ import {
   syntheticCapture,
   type SyntaxNode,
 } from '../../utils/ast-helpers.js';
+import { collectEsmExportEvidence, esmExportVerdict } from '../../ts-js-export-marker.js';
 import { splitImportStatement } from '../typescript/import-decomposer.js';
 import { getJsParser, getJsScopeQuery, jsCachedTreeMatchesGrammar } from './query.js';
 import { computeTsArityMetadata } from '../typescript/arity-metadata.js';
@@ -51,6 +52,7 @@ import { reducesToContainedType } from '../typescript/interpret.js';
 const JS_CLASS_FIELD_DEFINITION_TYPES: ReadonlySet<string> = new Set(['field_definition']);
 import { hasKeyword } from '../../field-extractors/configs/helpers.js';
 import { synthesizeCjsModuleExports } from '../typescript/cjs-module-exports.js';
+import { synthesizeTsLocalImports } from '../typescript/local-loaders.js';
 import {
   isShadowedCjsExportAssignment,
   isUnexportedMemberAssignmentValue,
@@ -63,6 +65,7 @@ import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captu
 import {
   deriveDefaultExportHocName,
   isBlockedDefaultExportHoc,
+  isBlockedPairCallbackRegistration,
   isDefaultExportHocFunctionNode,
 } from '../../ts-js-hoc-utils.js';
 
@@ -243,104 +246,6 @@ function inferArgType(argNode: SyntaxNode): string {
     }
     default:
       return '';
-  }
-}
-
-// ─── CJS require() decomposition ─────────────────────────────────────────
-
-/**
- * Walk the AST and synthesize `@import.*` captures for CJS `require()` calls:
- *
- *   - `const { X, Y } = require('./m')` → one match per destructured name,
- *     `@import.kind = 'named'`, `@import.name = X / Y`.
- *   - `const X = require('./m')` → `@import.kind = 'namespace'`,
- *     `@import.alias = X` (the whole module is bound to X).
- *   - `require('./m')` as a bare expression-statement → side-effect.
- *
- * CJS named-alias form (`const { X: alias } = require('./m')`) emits
- * `@import.kind = 'named-alias'` with `@import.name = X` and
- * `@import.alias = alias`.
- *
- * The synthesized markers are identical to those produced by
- * `splitImportStatement` for ESM, so `interpretJsImport` can delegate
- * unchanged to `interpretTsImport` for all cases.
- */
-function synthesizeCjsImports(root: SyntaxNode, out: CaptureMatch[]): void {
-  const stack: SyntaxNode[] = [root];
-  for (;;) {
-    const node = stack.pop();
-    if (node === undefined) break;
-    for (const child of node.namedChildren) {
-      if (child !== null) stack.push(child);
-    }
-
-    if (node.type !== 'call_expression') continue;
-
-    // Require call: function must be bare identifier "require".
-    const fn = node.childForFieldName('function');
-    if (fn === null || fn.type !== 'identifier' || fn.text !== 'require') continue;
-
-    const argsNode = node.childForFieldName('arguments');
-    if (argsNode === null) continue;
-
-    // Source must be a string literal.
-    const firstArg = argsNode.namedChild(0);
-    if (firstArg === null || firstArg.type !== 'string') continue;
-    const rawSource = firstArg.text; // includes surrounding quotes
-    const source = firstArg.namedChild(0)?.text ?? rawSource.slice(1, -1);
-
-    const parent = node.parent;
-
-    // Case 1: const { X } = require('./m') OR const X = require('./m')
-    if (parent?.type === 'variable_declarator') {
-      const nameNode = parent.childForFieldName('name');
-      if (nameNode === null) continue;
-
-      if (nameNode.type === 'object_pattern') {
-        // Destructured: emit one match per specifier.
-        for (const field of nameNode.namedChildren) {
-          if (field === null) continue;
-          if (field.type === 'shorthand_property_identifier_pattern') {
-            const name = field.text;
-            out.push({
-              '@import.statement': syntheticCapture('@import.statement', node, rawSource),
-              '@import.kind': syntheticCapture('@import.kind', node, 'named'),
-              '@import.name': syntheticCapture('@import.name', field, name),
-              '@import.source': syntheticCapture('@import.source', firstArg, source),
-            });
-          } else if (field.type === 'pair_pattern') {
-            const key = field.childForFieldName('key');
-            const value = field.childForFieldName('value');
-            if (key === null || value === null || value.type !== 'identifier') continue;
-            out.push({
-              '@import.statement': syntheticCapture('@import.statement', node, rawSource),
-              '@import.kind': syntheticCapture('@import.kind', node, 'named-alias'),
-              '@import.name': syntheticCapture('@import.name', key, key.text),
-              '@import.alias': syntheticCapture('@import.alias', value, value.text),
-              '@import.source': syntheticCapture('@import.source', firstArg, source),
-            });
-          }
-        }
-      } else if (nameNode.type === 'identifier') {
-        // Namespace-style: const X = require('./m') → bind whole module to X.
-        out.push({
-          '@import.statement': syntheticCapture('@import.statement', node, rawSource),
-          '@import.kind': syntheticCapture('@import.kind', node, 'namespace'),
-          '@import.alias': syntheticCapture('@import.alias', nameNode, nameNode.text),
-          '@import.source': syntheticCapture('@import.source', firstArg, source),
-        });
-      }
-      continue;
-    }
-
-    // Case 2: bare require('./m') — side-effect import.
-    if (parent?.type === 'expression_statement') {
-      out.push({
-        '@import.statement': syntheticCapture('@import.statement', node, rawSource),
-        '@import.kind': syntheticCapture('@import.kind', node, 'side-effect'),
-        '@import.source': syntheticCapture('@import.source', firstArg, source),
-      });
-    }
   }
 }
 
@@ -971,18 +876,22 @@ export function emitJsScopeCaptures(
   sourceText: string,
   filePath: string,
   cachedTree?: unknown,
+  sourceMeta?: { scriptLanguage?: string },
 ): readonly CaptureMatch[] {
+  const grammarPath = sourceMeta?.scriptLanguage === 'jsx' ? `${filePath}.jsx` : filePath;
   let tree = cachedTree as ReturnType<ReturnType<typeof getJsParser>['parse']> | undefined;
   if (tree !== undefined && !jsCachedTreeMatchesGrammar(tree)) {
     tree = undefined;
   }
   if (tree === undefined) {
-    tree = parseSourceSafe(getJsParser(filePath), sourceText, undefined, {
+    tree = parseSourceSafe(getJsParser(grammarPath), sourceText, undefined, {
       bufferSize: getTreeSitterBufferSize(sourceText),
     });
   }
 
-  const rawMatches = getJsScopeQuery(filePath).matches(tree.rootNode);
+  const rawMatches = getJsScopeQuery(grammarPath).matches(tree.rootNode);
+  // Export evidence, read once per file (see `ts-js-export-marker.ts`).
+  const exportEvidence = collectEsmExportEvidence(tree.rootNode, filePath);
   const out: CaptureMatch[] = [];
 
   for (const m of rawMatches) {
@@ -1091,6 +1000,13 @@ export function emitJsScopeCaptures(
       if (arrowNode !== null && isBlockedDefaultExportHoc(arrowNode)) {
         continue;
       }
+      // Pair-value built-in registrations (`{ timer: setTimeout(() => …) }`,
+      // `{ later: promise.then(() => …) }`) bind handles/values, not
+      // callables. See `isBlockedPairCallbackRegistration` for why this
+      // gate lives emit-side rather than in the query predicates.
+      if (arrowNode !== null && isBlockedPairCallbackRegistration(arrowNode)) {
+        continue;
+      }
       // #2723 — see the matching filter in `typescript/captures.ts`.
       if (arrowNode !== null && isShadowedCjsExportAssignment(arrowNode, tree.rootNode)) {
         continue;
@@ -1123,6 +1039,13 @@ export function emitJsScopeCaptures(
           '@declaration.name',
           fnNode,
           deriveDefaultExportHocName(filePath),
+        );
+        // This declaration's name is synthetic, so the later query-name
+        // marker cannot see it. The HOC predicate already proves the export.
+        grouped['@declaration.is-exported'] = syntheticCapture(
+          '@declaration.is-exported',
+          fnNode,
+          'true',
         );
       }
     }
@@ -1207,6 +1130,20 @@ export function emitJsScopeCaptures(
     // non-call match, an absent receiver, or a chain with no nameable base
     // all leave `grouped` untouched.
     synthesizeReceiverChainCapture(grouped, groupedNodes['@reference.receiver']);
+    // `@declaration.is-exported`: a verdict for every declaration the file's
+    // export surface can decide (see `ts-js-export-marker.ts`); nothing where
+    // it cannot, because absence is the honest answer there.
+    const declNameNode = groupedNodes['@declaration.name'];
+    if (exportEvidence !== undefined && declNameNode !== undefined) {
+      const verdict = esmExportVerdict(declNameNode, exportEvidence);
+      if (verdict !== undefined) {
+        grouped['@declaration.is-exported'] = syntheticCapture(
+          '@declaration.is-exported',
+          declNameNode,
+          verdict ? 'true' : 'false',
+        );
+      }
+    }
     out.push(grouped);
 
     // Synthesize `this` receiver type-bindings on class member functions.
@@ -1225,8 +1162,8 @@ export function emitJsScopeCaptures(
   }
 
   // Post-query synthesis passes.
-  synthesizeCjsImports(tree.rootNode, out);
-  synthesizeCjsModuleExports(tree.rootNode, filePath, out);
+  const validRequireCalls = synthesizeTsLocalImports(tree.rootNode, filePath, out);
+  synthesizeCjsModuleExports(tree.rootNode, filePath, out, validRequireCalls);
   synthesizeJsDocBindings(tree.rootNode, out);
   synthesizeConstructorFieldBindings(tree.rootNode, out);
   synthesizeDestructuringBindings(tree.rootNode, out);

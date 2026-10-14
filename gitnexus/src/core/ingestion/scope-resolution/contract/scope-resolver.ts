@@ -79,16 +79,17 @@
  *     pass running first prevents the wrong edge.
  *
  *   - **I2 — `handledSites` semantics.** A site is added to
- *     `handledSites` IFF a `tryEmitEdge` call returned `true` for it.
- *     Sites a pass touched but couldn't resolve do NOT get marked —
- *     they still get a chance from the shared resolver. Exception:
- *     the free-call fallback marks the site unconditionally after
- *     attempting emission (even on dedup-collapse), because the
- *     per-(caller, target) collapse semantics require multiple call
- *     sites in the same caller body not produce multiple edges.
- *     `preEmitInheritanceEdges` also pre-marks every `inherits` site so
- *     the generic bridge cannot remap class heritage into method-owned
- *     EXTENDS edges via `resolveCallerGraphId`.
+ *     `handledSites` after successful emission or a definitive suppression
+ *     that must prevent receiver-blind fallback. Ordinary unresolved misses
+ *     remain unhandled so the shared resolver can try them. Additionally,
+ *     the free-call fallback marks the site after it decides the site,
+ *     including when it emits no edge — dedup-collapse, a visibility
+ *     veto (`fallback-refused`), or a selected callable that is deleted
+ *     / invisible. The later generic pass must not recreate an edge
+ *     that pass just refused. `preEmitInheritanceEdges` also pre-marks
+ *     every `inherits` site so the generic bridge cannot remap class
+ *     heritage into method-owned EXTENDS edges via
+ *     `resolveCallerGraphId`.
  *
  *   - **I3 — `propagateImportedReturnTypes` mutation timing + ordering.**
  *     The pass mutates `Scope.typeBindings` (a plain `new Map(...)` from
@@ -131,7 +132,8 @@
  *       6. Case 3 dotted typeBinding for namespace prefix
  *       7. Case 3b chain-typebinding (compound resolver + interface-dispatch
  *          fan-out on an Interface fold, #2832)
- *       8. Case 4 simple typeBinding (MRO walk + findOwnedMember)
+ *       8. Case 4 simple typeBinding (MRO walk + findOwnedMember, then an
+ *          opt-in concrete-subtype fan-out when the normal member is missing)
  *     Reordering or merging cases changes resolution semantics. The
  *     numbering is part of the contract — keep the comments.
  *
@@ -248,8 +250,8 @@
  * ## Semantic-model source of truth
  *
  * `ParsedFile` (from `gitnexus-shared/src/scope-resolution/parsed-file.ts`)
- * is the single semantic model consumed by both the legacy DAG and the
- * scope-resolution pipeline. Scope-resolution passes MUST NOT build a
+ * is the single semantic model consumed by the scope-resolution pipeline.
+ * Scope-resolution passes MUST NOT build a
  * parallel parse representation; if a pass needs AST-level facts that
  * `ParsedFile` doesn't expose, it should reuse the orchestrator's
  * `treeCache` (see `RunScopeResolutionInput.treeCache`) rather than
@@ -257,30 +259,29 @@
  *
  * ## Same-graph guarantee
  *
- * Edges emitted by `runScopeResolution` and edges emitted by the legacy
- * DAG are indistinguishable to downstream consumers:
+ * All language resolvers emit edges through `runScopeResolution` using the
+ * shared graph contract:
  *   - Node identity: same `generateId(...)` helper, same qualified-name
  *     keyspace, same File/Folder/Method/Class node labels.
  *   - Edge vocabulary: `'import-resolved' | 'global' | 'local-call' |
- *     'same-file' | 'interface-dispatch' | 'read' | 'write'` — both
- *     paths emit the same reasons (see
- *     `gitnexus/src/core/ingestion/call-processor.ts` for the legacy
- *     emitter and `passes/receiver-bound-calls.ts` /
+ *     'same-file' | 'interface-dispatch' | 'read' | 'write' |
+ *     'global-name-fallback'` (see `passes/receiver-bound-calls.ts` /
  *     `passes/free-call-fallback.ts` for the scope-resolution emitters).
- *   - Overload disambiguation: both paths use
+ *   - Overload disambiguation: resolvers use
  *     `generateId('Method', ...)` suffixed with `parameterTypes` when a
  *     method has overloads — see `graph-bridge/ids.ts`.
  *
- * The CI parity workflow (`.github/workflows/ci-scope-parity.yml`)
- * runs both paths on every migrated language's fixture corpus and
- * fails if the graph outputs diverge.
+ * Resolver fixture coverage lives in `ci-tests.yml` (the separate
+ * `ci-scope-parity.yml` gate was removed in RING4-1 #942).
  *
  * Plan that introduced most of these invariants:
  * `docs/plans/2026-04-20-001-refactor-emit-pipeline-generalization-plan.md`.
  */
 
 import type { DecorationStripper } from '../scope/walkers.js';
+import type { SourceBindingRecorder } from '../source-binding-resolution.js';
 import type {
+  NameLookupOptions,
   BindingRef,
   Callsite,
   ConstraintContext,
@@ -290,6 +291,7 @@ import type {
   ScopeId,
   SupportedLanguages,
   SymbolDefinition,
+  TypeRef,
 } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { GraphNodeLookup } from '../graph-bridge/node-lookup.js';
@@ -421,6 +423,16 @@ export interface ScopeResolver {
     context?: ImportResolutionContext,
   ): string | readonly string[] | null;
 
+  /** Resolve names declared by the imported module after its files are known.
+   * Shared by route handlers and ordinary scope bindings. May return the input
+   * unchanged; changed bindings must be copies so extraction output and
+   * parse-cache entries remain unchanged. */
+  readonly resolveImportBinding?: (
+    parsedImport: ParsedImport,
+    resolveTargetFiles: () => readonly string[],
+    sourceTextFor: (filePath: string) => string | undefined,
+  ) => ParsedImport;
+
   /**
    * Optionally reclassify an import as a namespace handle after target
    * resolution proves the imported name is itself a module. Returning false
@@ -442,6 +454,17 @@ export interface ScopeResolver {
     parsedFiles: readonly ParsedFile[],
   ) => readonly string[];
 
+  /** Exact local module bindings, excluding definitions owned by nested scopes. */
+  readonly moduleExports?: (file: ParsedFile) => ReadonlyMap<string, SymbolDefinition>;
+
+  /** Filter local and transitive export names for wildcard imports. Opting in
+   * applies the filter both to re-export closures and imported bindings. */
+  readonly filterWildcardNames?: (
+    targetModuleScope: ScopeId,
+    availableNames: readonly string[],
+    parsedFiles: readonly ParsedFile[],
+  ) => readonly string[];
+
   /**
    * Optional one-shot loader for cross-file import-resolution config
    * (e.g. tsconfig path aliases for TypeScript, go.mod paths for Go,
@@ -460,6 +483,19 @@ export interface ScopeResolver {
    * `resolveImportTarget` casts it to the language's expected shape.
    */
   loadResolutionConfig?(repoPath: string): Promise<unknown> | unknown;
+
+  /**
+   * Capture metadata from the scan's complete, nonignored candidate paths,
+   * before unreadable/large source files are filtered out. Called once for a
+   * language present in the scan. The compact result is shared by every
+   * resolution pass instead of calling loadResolutionConfig again.
+   * Capture failures must throw; consumers must not mutate the result.
+   * This is a stable-workspace input boundary, not an atomic filesystem snapshot.
+   */
+  captureResolutionConfig?(
+    repoPath: string,
+    filePaths: readonly string[],
+  ): Promise<unknown> | unknown;
 
   /**
    * Per-scope binding-merge precedence. The shared finalize pass
@@ -528,11 +564,9 @@ export interface ScopeResolver {
 
   /**
    * Compute the method-dispatch order for every Class def in the
-   * workspace. Python uses depth-first first-seen via
-   * `pythonLinearize`; future languages may use C3 (Ruby, Python's
-   * real MRO when we go beyond the simplified walk), single-
-   * inheritance only (Java), or empty-map (languages without
-   * inheritance).
+   * workspace. Python passes `c3LinearizeStrategy` (CPython's MRO).
+   * Single-inheritance languages pass `defaultLinearize`. Languages
+   * without inheritance return an empty map.
    */
   buildMro(
     graph: KnowledgeGraph,
@@ -694,7 +728,27 @@ export interface ScopeResolver {
    */
   readonly populateWorkspaceOwners?: (
     parsedFiles: readonly ParsedFile[],
-    ctx: { readonly fileContents: ReadonlyMap<string, string> },
+    ctx: {
+      readonly fileContents: ReadonlyMap<string, string>;
+      readonly resolutionConfig?: unknown;
+    },
+  ) => void;
+
+  /**
+   * Optional workspace-wide enrichment of extracted reference sites and their
+   * lexical name claims. Providers replace affected ParsedFile/scope records
+   * rather than mutating extraction snapshots or finalized indexes. Runs
+   * after all files have been extracted and before reference finalization.
+   * Use this when a per-file capture needs conservative facts from an
+   * imported sibling (for example a compile-time branch constant).
+   */
+  readonly populateWorkspaceReferences?: (
+    parsedFiles: ParsedFile[],
+    ctx: {
+      readonly fileContents: ReadonlyMap<string, string>;
+      readonly treeCache?: { get(filePath: string): unknown };
+      readonly resolutionConfig?: unknown;
+    },
   ) => void;
 
   /**
@@ -850,6 +904,95 @@ export interface ScopeResolver {
    */
   readonly allowGlobalFreeCallFallback?: boolean;
 
+  /** Opt in to binding imports at their extracted lexical scope, rather than
+   * publishing every file's imports at module scope. */
+  readonly importsBindAtLexicalScope?: boolean;
+
+  /** Whether class-owned definitions also populate the legacy module lookup
+   * bucket. Disable when bare names must follow lexical bindings exclusively.
+   * Defaults to true; synthetic declarations remain available for dispatch. */
+  readonly ownedMembersBindAtModuleScope?: boolean;
+
+  /**
+   * Two `wildcard` re-exports that both DECLARE a name make it AMBIGUOUS in
+   * this language — ECMAScript `export *` semantics, where the module simply
+   * does not export the name and any binding is a guess. Opt-in: for a
+   * language whose wildcard import is `#include`, `require` or a package
+   * fan-out, the same name in two files is an overload set or a redeclaration,
+   * and refusing it would delete real edges (C++ arity-narrowed overloads
+   * across two headers). Forwarded to `FinalizeHooks.wildcardCollisionIsAmbiguous`.
+   */
+  readonly exclusiveWildcardReexports?: boolean;
+
+  /**
+   * A named import or named re-export can only bind to a MODULE-LEVEL
+   * declaration of the target file — ECMAScript semantics, where
+   * `import { x }` never reaches a class member. Opt-in: languages that bind
+   * module-level members by bare name (static members, module functions)
+   * leave it off. Forwarded to `FinalizeHooks.namedImportsBindTopLevelOnly`.
+   */
+  readonly namedImportsBindTopLevelOnly?: boolean;
+
+  /**
+   * Veto for a single `allowGlobalFreeCallFallback` guess.
+   *
+   * The fallback picks a callable because its SIMPLE NAME is unique in the
+   * workspace — it consults no import and no scope chain. For most languages a
+   * large share of those guesses are not merely unlikely but IMPOSSIBLE: Go
+   * cannot call an unexported identifier from another package, ESM cannot see a
+   * name it did not import, Rust cannot reach an item with no `use` path. This
+   * hook is where a language states those rules, so the shared pass can drop
+   * the edge instead of publishing a guess that the language forbids.
+   *
+   * Return `false` to REFUSE (no edge, recorded as `fallback-refused`). Return
+   * `true`, or leave the hook undefined, to emit the labeled
+   * `global-name-fallback` edge. **Only answer `false` when the call is
+   * impossible, not when it is merely unproven** — a wrongly-refused candidate
+   * is a lost real edge, whereas a wrongly-allowed one is at least labeled and
+   * excluded from flows.
+   *
+   * Deliberately NOT folded into `isCallableVisibleFromCaller`: that hook also
+   * gates precise dispatch paths (implicit-this, member calls), so a rule
+   * written for the name-guess tier would silently suppress resolved edges too.
+   *
+   * `parsedFileOf` reaches the CANDIDATE's parse result — a language whose rule
+   * depends on declaration-side facts not carried by `SymbolDefinition` (for
+   * example Rust's `pub` form) needs it. `isExported` is the tri-state export
+   * marker when the language supplies one; this hook still needs the parse for
+   * visibility facts that marker does not represent. It returns `undefined`
+   * for a path outside this pass's file set; treat that as "cannot decide"
+   * and allow.
+   */
+  readonly isGlobalNameFallbackPlausible?: (ctx: {
+    readonly callerParsed: ParsedFile;
+    readonly candidate: SymbolDefinition;
+    /** Opaque workspace metadata from this provider's loadResolutionConfig. */
+    readonly resolutionConfig?: unknown;
+    readonly parsedFileOf: (filePath: string) => ParsedFile | undefined;
+    /**
+     * Raw source of any parsed file, for languages whose visibility rule needs
+     * a declaration the parse does not carry (Go's package clause: a test file's
+     * `package foo_test` is a different package from its directory's `foo`).
+     * Absent when the pipeline has no contents at hand; hooks must then answer
+     * from paths alone and, when undecidable, allow.
+     */
+    readonly sourceTextOf?: (filePath: string) => string | undefined;
+    /**
+     * The call site, so a language can tell a BARE name from a PATH-QUALIFIED
+     * one. Both reach this tier — a qualified call whose qualifier the resolver
+     * could not follow falls through to the bare-name search with only its tail
+     * name — but they are not the same claim. Rust's `User::new(...)` named its
+     * type in source, so refusing it for lacking a `use` of the module would
+     * delete an edge the source spells out.
+     */
+    readonly site: {
+      readonly name: string;
+      readonly rawQualifiedName?: string;
+      /** Lexical call-site scope; absent only for legacy/synthetic hook callers. */
+      readonly inScope?: ScopeId;
+    };
+  }) => boolean;
+
   /**
    * In this language every `Method` belongs to a class instance, so a
    * FREE (receiver-less) call may resolve to a `Method` only when the
@@ -867,6 +1010,11 @@ export interface ScopeResolver {
    * regression).
    */
   readonly freeCallsRequireInstanceOwnership?: boolean;
+
+  /** Whether an unqualified call inside a type may dispatch to an inherited
+   * instance method. Languages such as Swift allow implicit-self lookup,
+   * while Python/JavaScript/PHP require an explicit receiver. */
+  readonly implicitThisWalksMro?: boolean;
 
   /**
    * When true, a constructor-form call `Type(...)` links to the Class def
@@ -924,6 +1072,40 @@ export interface ScopeResolver {
    * member a consumer can name through the hub is public by construction.
    */
   readonly namespaceExportsIncludeImportedNames?: boolean;
+
+  /**
+   * Whether `member`, a declaration reached through a namespace-qualified
+   * reference (`ns.member`, `ns.Type`, `x: ns.Type`) written OUTSIDE the
+   * namespace that declares it, is nameable from there.
+   *
+   * The namespace lookups (`findExportedDef` and the receiver-bound / qualified
+   * type paths built on it) read the target module's local bindings and treat
+   * every one as a public member; they carry no notion of a module-private
+   * declaration. A language whose visibility is decidable from the declaration
+   * alone states that rule here, so `ns.hidden` yields no binding instead of a
+   * confident `import-resolved` edge to a declaration the language forbids
+   * reaching. Returning `false` makes the namespace lookups behave as if the
+   * name were not declared.
+   *
+   * Consulted by: the namespace-member lookup (`findExportedDef`) behind the
+   * receiver-bound member / chain / typed-receiver paths and the compound
+   * receiver's construction branch, and the namespace-import branch of
+   * `findClassBindingInScope` (qualified type references, qualified constructor
+   * calls). NOT consulted by the name-guess tiers (that is
+   * `isGlobalNameFallbackPlausible`), by member selectors on a value, or by the
+   * `value-ref` registration lookup.
+   *
+   * A bare name bound through an import or a same-namespace sibling is the
+   * finalized-binding channel's business (it already decides what an import
+   * publishes), and this hook is deliberately not applied there: a sibling
+   * file's private declaration IS visible without qualification.
+   *
+   * **Only answer `false` when the reference is impossible, not when it is
+   * merely unproven** — a wrongly-refused member is a lost real edge. Must be
+   * pure. Undefined (the default) keeps every namespace member visible, which
+   * is the behaviour of every language that does not implement it.
+   */
+  readonly isNamespaceMemberVisible?: (ctx: { readonly member: SymbolDefinition }) => boolean;
 
   /**
    * When true, a qualified receiver is walked SEGMENT BY SEGMENT from its
@@ -1120,6 +1302,9 @@ export interface ScopeResolver {
   readonly isCallableVisibleFromCaller?: (ctx: {
     readonly callerParsed: ParsedFile;
     readonly candidate: SymbolDefinition;
+    /** Arity of the actual call, when known. A visibility veto must not
+     *  infer applicability from a name match alone. */
+    readonly callArity?: number;
     /** Caller's enclosing scope id. Languages that gate visibility on
      *  caller scope (e.g. C++ two-phase template lookup) consult it;
      *  others ignore. Optional so existing implementations stay valid. */
@@ -1158,6 +1343,23 @@ export interface ScopeResolver {
     scopes: ScopeResolutionIndexes,
     parsedFiles: readonly ParsedFile[],
   ) => readonly SymbolDefinition[] | undefined;
+
+  /**
+   * Ordinary lexical lookup paired with `resolveAdlCandidates`. The provider
+   * preserves shared name-claim selection, then normalizes its declarations
+   * and reports whether the selected tier blocks argument-dependent lookup.
+   * Both hooks must be supplied to enable that additional candidate tier.
+   */
+  readonly resolveOrdinaryCallables?: (
+    startScope: ScopeId,
+    name: string,
+    scopes: ScopeResolutionIndexes,
+    options?: NameLookupOptions,
+  ) => {
+    readonly callables: readonly SymbolDefinition[];
+    readonly nonCallableFound: boolean;
+    readonly blockScopeDeclFound: boolean;
+  };
 
   /**
    * Optional resolver for a module-qualified FREE call — a call written with
@@ -1259,9 +1461,48 @@ export interface ScopeResolver {
       readonly localName: string;
       readonly importPath: string;
       readonly targetFile: string;
+      readonly explicitAlias?: boolean;
     },
     moduleFileExists: (filePath: string) => boolean,
   ) => readonly (readonly [spelling: string, targetFile: string])[] | undefined;
+
+  /** Stable identity of the namespace object bound by an import. Equal identities
+   * allow distinct receiver paths to remain visible across lexical scopes.
+   * Supplying this hook also suppresses same-scope import names with conflicting
+   * or unprovably equal identities; a lone namespace with undefined identity
+   * remains eligible. Without the hook, same-scope multi-target behavior stays. */
+  readonly namespaceBindingIdentity?: (edge: {
+    readonly localName: string;
+    readonly importPath: string;
+    readonly targetFile: string;
+    readonly explicitAlias?: boolean;
+  }) => string | undefined;
+
+  /** Enclosing class bodies are not lexical environments for namespace lookup.
+   * The reference's own class scope remains visible for class-body expressions. */
+  readonly namespaceSkipsEnclosingClasses?: boolean;
+
+  /** Prove namespace-valued receiver expressions using provider capture facts.
+   * Created once per receiver pass so providers can index local facts and memoize
+   * callable results. Targets feed the ordinary namespace-member path; declined
+   * call results retain their origin for final unresolved-call accounting. */
+  readonly createReceiverNamespaceResolver?: (
+    scopes: ScopeResolutionIndexes,
+    index: WorkspaceResolutionIndex,
+  ) => (
+    site: ReferenceSite,
+    parsed: ParsedFile,
+  ) =>
+    | {
+        readonly targetFiles?: readonly string[];
+        readonly callResultOrigin: {
+          readonly name: string;
+          readonly inScope: ScopeId;
+          /** False when this call is only one possible assignment origin. */
+          readonly isDefinite?: boolean;
+        };
+      }
+    | undefined;
 
   /**
    * Optional language-specific member-lattice lookup. Runs for a resolved
@@ -1273,10 +1514,15 @@ export interface ScopeResolver {
   readonly resolveReceiverMember?: (
     ownerDef: SymbolDefinition,
     memberName: string,
-    callsite: Callsite,
+    callsite: ReferenceSite,
     scopes: ScopeResolutionIndexes,
     model: SemanticModel,
   ) => ReceiverMemberResolution | undefined;
+
+  /** Suppress all receiver dispatch when a captured type cannot prove its
+   * runtime binding. Runs before compound and simple receiver lookup; the
+   * caller records a receiver-unresolved outcome. */
+  readonly suppressReceiverLookup?: (typeRef: TypeRef) => boolean;
 
   /**
    * Enable the receiver-bound Case 0.5 fallback for explicit `this`
@@ -1289,6 +1535,59 @@ export interface ScopeResolver {
    * suppression must remain unchanged.
    */
   readonly resolveThisViaEnclosingClass?: boolean;
+
+  /**
+   * Opt a receiver type fact into subtype dispatch when Case 4 resolves the
+   * receiver's declared class but finds no same-named member on that class or
+   * its ancestors. The shared pass walks the concrete subtype closure and
+   * emits up to the shared fan-out cap of unique, arity-compatible
+   * implementations it can prove.
+   *
+   * This is deliberately a predicate rather than a language check in shared
+   * ingestion. Dynamic languages can enable only type facts whose runtime
+   * class may legally supply a member absent from the declared owner (Python's
+   * synthesized instance-receiver binding, for example). A declined receiver
+   * retains the existing owner/MRO behavior byte-for-byte.
+   *
+   * `callerIsStatic` is the existing graph-node fact for the callable that
+   * contains the site. `receiverBindingIsStatic` is the corresponding fact
+   * for the callable where the receiver TypeRef was declared. The latter is
+   * load-bearing for closures that inherit an outer receiver binding. Either
+   * is undefined when its callable cannot be resolved; providers using these
+   * facts to distinguish dispatch kinds should fail closed. `memberName` and
+   * `callArity` are the already-captured site facts; providers may return
+   * `'suppress'` when those facts prove the language cannot safely infer a
+   * subtype target but receiver-blind fallback would be wrong.
+   *
+   * When enabled, a no-target or overload-ambiguous result is a definitive
+   * receiver-bound miss: the pass records a suppression and marks the site
+   * handled so receiver-blind name fallback cannot mint a false exact edge.
+   */
+  readonly resolveMissingReceiverMembersFromSubtypes?: (
+    typeRef: TypeRef,
+    context: {
+      readonly callerIsStatic: boolean | undefined;
+      readonly receiverBindingIsStatic: boolean | undefined;
+      readonly memberName: string;
+      readonly callArity: number | undefined;
+    },
+  ) => boolean | 'suppress';
+
+  /**
+   * Optional language-specific compatibility check for each candidate found by
+   * `resolveMissingReceiverMembersFromSubtypes`. It runs in addition to ordinary
+   * arity filtering. `unknown` suppresses the whole inferred site rather than
+   * publishing a partial subtype fan-out as complete.
+   *
+   * Python uses this with private capture-side-channel facts to prove that an
+   * ordinary positional call fits a target's positional parameter capacity,
+   * without adding argument-kind fields to the public `ReferenceSite` schema.
+   */
+  readonly missingReceiverSubtypeCandidateCompatibility?: (
+    callsite: ReferenceSite,
+    candidate: SymbolDefinition,
+    context: { readonly callerFilePath: string },
+  ) => ArityVerdict;
 
   /**
    * Optional post-finalize hook to inject cross-file bindings that
@@ -1540,6 +1839,9 @@ export interface ScopeResolver {
     ctx: {
       readonly fileContents: ReadonlyMap<string, string>;
       readonly resolutionConfig?: unknown;
+      /** Observe the source declaration at the provider's actual decision,
+       * before runtime target expansion or graph edge deduplication. */
+      readonly recordSourceBinding?: SourceBindingRecorder;
     },
   ) => void;
 

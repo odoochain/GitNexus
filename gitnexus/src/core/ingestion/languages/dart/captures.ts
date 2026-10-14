@@ -119,6 +119,23 @@ const DART_CALLABLE_CAPTURE_OPTIONS = {
   extractCallCallee: (node: SyntaxNode) => dartCallableCallee(node) ?? undefined,
   callSiteNode: (node: SyntaxNode) => dartCallableCallee(node) ?? undefined,
   callableProtocolMethods: new Set(['call']),
+  // tree-sitter-dart spells `a ?? b` as `if_null_expression(first:, second:)`
+  // and `c ? a : b` as a `conditional_expression` with `consequence` /
+  // `alternative` but NO `condition` field, so neither matches the shared
+  // field-based branch rule and only the last operand flowed (#3354).
+  valueAlternatives: (node: SyntaxNode) => {
+    if (node.type === 'if_null_expression') {
+      const first = node.childForFieldName('first');
+      const second = node.childForFieldName('second');
+      return first !== null && second !== null ? [first, second] : undefined;
+    }
+    if (node.type === 'conditional_expression') {
+      const consequence = node.childForFieldName('consequence');
+      const alternative = node.childForFieldName('alternative');
+      return consequence !== null && alternative !== null ? [consequence, alternative] : undefined;
+    }
+    return undefined;
+  },
 } as const;
 
 function dartLexicalFunctionOwner(input: SyntaxNode): SyntaxNode | undefined {
@@ -274,7 +291,10 @@ export function emitDartScopeCaptures(
   // ── Pass B: tree-walked references, type inference, heritage ────────────
   const seenReadSpans = new Set<string>();
   walkNamedTree(root, (node) => {
-    if (node.type === 'selector') {
+    if (
+      node.type === 'selector' ||
+      (ASSIGNABLE_SELECTORS.has(node.type) && node.parent?.type !== 'selector')
+    ) {
       emitSelectorReference(node, out, seenReadSpans);
       return;
     }
@@ -429,7 +449,7 @@ function computeReceiverText(nameSelector: SyntaxNode): string | null {
   let cur = nameSelector.previousNamedSibling;
   let head: SyntaxNode | null = null;
   while (cur !== null) {
-    if (cur.type === 'selector') {
+    if (cur.type === 'selector' || ASSIGNABLE_SELECTORS.has(cur.type)) {
       selectors.push(cur);
       cur = cur.previousNamedSibling;
       continue;
@@ -450,7 +470,9 @@ function emitSelectorReference(
   out: CaptureMatch[],
   seenReadSpans: Set<string>,
 ): void {
-  const inner = selector.namedChild(0);
+  // `super.member` and the final member of an assignment target are bare
+  // assignable selectors; other postfix members have a `selector` wrapper.
+  const inner = selector.type === 'selector' ? selector.namedChild(0) : selector;
   if (inner === null) return;
 
   // A `selector(argument_part)` is the call marker; the callee is the
@@ -475,8 +497,8 @@ function emitSelectorReference(
       });
       return;
     }
-    if (prev.type === 'selector') {
-      const prevInner = prev.namedChild(0);
+    if (prev.type === 'selector' || ASSIGNABLE_SELECTORS.has(prev.type)) {
+      const prevInner = prev.type === 'selector' ? prev.namedChild(0) : prev;
       if (prevInner === null) return;
       if (ASSIGNABLE_SELECTORS.has(prevInner.type)) {
         const nameId = selectorName(prevInner);
@@ -497,8 +519,8 @@ function emitSelectorReference(
     return;
   }
 
-  // A member access selector that is NOT immediately followed by a call is a
-  // field read (`user.address` in `user.address.save()`).
+  // A member not followed by a call is a read, except the final selector on
+  // an assignment's left side. Intermediate receivers remain reads.
   if (ASSIGNABLE_SELECTORS.has(inner.type)) {
     const next = selector.nextNamedSibling;
     const isCall =
@@ -514,8 +536,14 @@ function emitSelectorReference(
     if (seenReadSpans.has(spanKey)) return;
     seenReadSpans.add(spanKey);
 
+    const target = selector.parent;
+    const isWrite =
+      target?.type === 'assignable_expression' &&
+      target.lastNamedChild?.id === selector.id &&
+      target.parent?.childForFieldName('left')?.id === target.id;
+    const tag = isWrite ? '@reference.write.member' : '@reference.read.member';
     out.push({
-      '@reference.read.member': nodeToCapture('@reference.read.member', nameId),
+      [tag]: nodeToCapture(tag, nameId),
       '@reference.name': nodeToCapture('@reference.name', nameId),
       '@reference.receiver': syntheticCapture('@reference.receiver', selector, recv),
     });

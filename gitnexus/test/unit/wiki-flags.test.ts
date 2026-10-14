@@ -10,6 +10,13 @@ import os from 'os';
 import path from 'path';
 import fs from 'fs/promises';
 
+const mockWikiStorage = () => {
+  vi.doMock('../../src/storage/storage-resolver.js', async (importActual) => ({
+    ...(await importActual<typeof import('../../src/storage/storage-resolver.js')>()),
+    requireStoragePath: vi.fn().mockResolvedValue('/tmp/wiki-storage'),
+  }));
+};
+
 // ─── detectCursorCLI caching ─────────────────────────────────────────
 
 describe('detectCursorCLI', () => {
@@ -368,6 +375,7 @@ describe('wikiCommand provider switch persistence', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -430,6 +438,7 @@ describe('wikiCommand provider switch persistence', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -648,6 +657,7 @@ describe('wikiCommand --timeout validation', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -707,6 +717,7 @@ describe('wikiCommand --timeout validation', () => {
           Presets: { shades_grey: {} },
         },
       }));
+      mockWikiStorage();
 
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -736,6 +747,7 @@ describe('wikiCommand --retries validation', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -795,6 +807,7 @@ describe('wikiCommand --retries validation', () => {
           Presets: { shades_grey: {} },
         },
       }));
+      mockWikiStorage();
 
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -820,6 +833,7 @@ describe('wikiCommand --timeout mapping', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -887,6 +901,7 @@ describe('wikiCommand --timeout mapping', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -958,6 +973,7 @@ describe('wikiCommand timeout messaging', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -1023,6 +1039,7 @@ describe('wikiCommand timeout messaging', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -1515,7 +1532,7 @@ describe('local agent CLI calls', () => {
       return stdinText;
     });
 
-    const spawnSpy = vi.fn(() => child);
+    const spawnSpy = vi.fn<typeof import('node:child_process').spawn>(() => child);
     vi.doMock('child_process', () => ({
       execFileSync: vi.fn().mockReturnValue('opencode 1.15.13'),
       spawn: spawnSpy,
@@ -1566,7 +1583,7 @@ describe('local agent CLI calls', () => {
       });
     });
 
-    const spawnSpy = vi.fn(() => child);
+    const spawnSpy = vi.fn<typeof import('node:child_process').spawn>(() => child);
     vi.doMock('child_process', () => ({
       execFileSync: vi.fn().mockReturnValue('opencode 1.15.13'),
       spawn: spawnSpy,
@@ -1763,7 +1780,7 @@ describe('local agent CLI calls', () => {
       });
     });
 
-    const spawnSpy = vi.fn(() => child);
+    const spawnSpy = vi.fn<typeof import('node:child_process').spawn>(() => child);
     vi.doMock('child_process', () => ({
       execFileSync: vi.fn().mockReturnValue('codex-cli 0.132.0'),
       spawn: spawnSpy,

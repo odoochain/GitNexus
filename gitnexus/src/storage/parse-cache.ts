@@ -250,7 +250,6 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // capture schemas would have shared one PARSE_CACHE_VERSION and the durable
 // ParsedFile store would have replayed pre-fix ParsedFiles verbatim for one of
 // them. Only comparing against origin/main at MERGE time surfaces it.
-// PR #2840 (Objective-C, draft) still claims 44 as well — it must move too.
 // RE-CHECK AGAINST origin/main IMMEDIATELY BEFORE MERGING.
 // 45 -> 46 for the JavaScript bare-identifier read captures (A2), which emit
 // `@reference.read.identifier` in value positions (call arguments,
@@ -664,6 +663,7 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // `route-extractors/` and `workers/` module content — would close the missing-
 // bump axis without invalidating on unrelated churn, and is the real follow-up.
 // RE-CHECK AGAINST origin/main AND OPEN PRs IMMEDIATELY BEFORE MERGING.
+//
 // 80 -> 81: ParsedFile and parse-cache shards are one immutable `.v8` envelope
 // each (no JSON/path/generation siblings). A v80 index still names `.json`
 // keys and would skip workers while scope-resolution found nothing — the
@@ -735,7 +735,136 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // v93: Zig call captures inside a comptime-false branch carry
 // `@reference.static-gated` (feat/zig-static-gated-edges); the site gains
 // `staticGated` and the CALLS edge a BOOLEAN column.
-const SCHEMA_BUMP = 93;
+// v94: Objective-C now elides bare, file-scope macro markers before parsing.
+// A warm v93 cache can retain error-recovered trees and provider facts that
+// omit Objective-C declarations following markers such as RCT_EXTERN_C_END.
+// v95: Objective-C header classification no longer treats framework `#import`
+// alone as Objective-C syntax. A warm v94 cache can replay Objective-C worker
+// output for a C++ header during `--force`, even though the current classifier
+// routes that same header through the C++ provider.
+// v96: Objective-C macro-marker preprocessing recognizes all C preprocessing
+// whitespace before a directive or bare marker. A warm v95 cache can retain
+// error-recovered facts for sources that begin those lines with form feed or
+// vertical tab.
+// v97: Objective-C macro-marker preprocessing recognizes comment-prefixed
+// directives and rejects invalid numeric marker prefixes. A warm v96 cache can
+// replay error-recovered facts from the previous normalization behavior.
+// v98 (#3219): `ZIG_SCOPE_QUERY` gained three `@reference.value-ref` rules —
+// bare call argument, qualified call argument (with `@reference.receiver`), and
+// const-binding initialiser — so a Zig callable named in VALUE position now
+// produces a `value-ref` entry in `ParsedFile.referenceSites` where it produced
+// none before. These captures are PARSE-TIME facts, so a warm pre-v98 cache
+// replays unchanged `.zig` files with zero value-ref sites, `--force` included
+// (shards are content-addressed): `emitPropertyDispatchCalls` then emits no
+// USES edge, `callableValueReferenceBoundaries` measures a real zero, and
+// `impact` on a registered accessor republishes `epistemic: "exact"` — the exact
+// #3399 defect this change exists to close, silently un-fixed.
+// v99: ParsedImport retains declaredAtScope and export evidence changes in
+// #3190. Old durable ParsedFiles lack the facts needed for scoped binding;
+// invalidate both stores so warm indexing actually applies the correction.
+// origin/main took 98 for #3219; 99 is the next free value.
+// v100 (#3253): Rust import captures preserve the leading `::` that selects
+// the extern prelude. Old warm captures erase it and cannot distinguish an
+// absolute library import from a same-named local module. Reparse both stores.
+// v101 (#3294 review): Rust bare-keyword glob imports retain crate/self/super
+// instead of an empty target path; restricted pub(...) imports are no longer
+// captured as unrestricted reexports. Re-extract both facts on warm indexes.
+// v102: ParsedFile gained callResultAssignmentSites; old durable shards do
+// not carry the exact assignment identity required by return-type replay.
+// v103 (#3339 review): tRPC route extraction changed — nested-router paths,
+// a tightened entry gate, and controller-less routes now bind handlers via a
+// same-file CALLS edge. Warm caches replay the flat pre-fix capture set
+// verbatim (route rows are parse-time facts), so both stores re-extract.
+// v104 (#3339 review): TS/JS pair-HOC queries now name object-pair
+// `mutation(withAuth(arrow))` handlers. Warm caches replay the pre-fix
+// capture set (anonymous arrows, no Function name), so both stores re-extract.
+// v112 (#3354): callable-value flow now follows each branch of `a ?? f`,
+// `a || f`, and `c ? f : g`. Warm caches replay the pre-fix flow facts, which
+// have no flow for those assignments, so both stores re-extract. 105-111 are
+// claimed by open PR #3326 (Elixir).
+// Same v112: the `valueAlternatives` provider hook extends it to Kotlin
+// `?:`/`if`, Swift/Dart `??`/`?:`, and Python `x if c else y`, and keeps a
+// Ruby multi-statement `if` one opaque source.
+// v113 (#3371): `.ipynb` code cells are extracted to Python before parse.
+// Warm caches keyed on raw JSON would replay empty/failed Python parses.
+// v114 (#2965): C and C++ angle includes are real wildcard imports with
+// `isSystem`. Warm shards stored those captures as absent, so incremental
+// analyze never asked the resolver to search include paths. 113 is #3371.
+// v115 (#3390): Python call captures now carry `@reference.arity` when the
+// argument count is statically known. Warm v114 ParsedFiles lack that fact, so
+// arity-aware method filtering would remain inert for every unchanged file.
+// v116 (#3390 follow-up): Python's private capture side-channel now records
+// simple-positional call sites and fixed positional method capacity. Warm v115
+// ParsedFiles lack those facts, so conservative mixin subtype dispatch would
+// suppress unchanged one-argument callers.
+// v117 (#3390 private-only successor): simple-positional call entries now carry
+// their count privately, while ordinary Python references no longer receive
+// synthetic arity. Warm v116 ParsedFiles have neither equivalent fact.
+// v118 (#3398): decorated Python methods with unproven decorator identity no
+// longer publish subtype positional capacity. Warm v117 side-channel snapshots
+// would retain that capacity and could emit a false concrete call target.
+// v119 (#3396): Python subtype method capacities now omit receiverless ordinary
+// methods. Warm v118 ParsedFiles would replay a false compatible target.
+// v120 (#3394): decorated Python method receiver bindings now distinguish
+// unproven decorators from instance receivers. Warm v119 ParsedFiles would
+// replay a fabricated `self` binding or lack the uncertainty marker entirely.
+// v121 (#3399 follow-up): Python decorator identity now ignores trailing
+// comments, honors rebinding of builtin descriptor names visible where the
+// decorator is evaluated, and withholds subtype capacity from descriptor
+// stacks. Warm v120 captures carry the old verdicts.
+// v122 (#3414): Python decorator identity models restoring helper calls and
+// treats match-pattern captures and nested nonlocal rebinds as shadowing.
+// Warm v121 captures carry the old verdicts.
+// v123 (#3408): FastAPI include records now carry `host`, router imports carry
+// `modulePath`, and unprefixed child includes are emitted. Warm v122 records
+// lack them, so nested router-prefix propagation would stay inert.
+// v124 (#3402): Go files now emit gin/echo `decoratorRoutes` carrying a
+// `handlerReceiver` hint. Warm v123 Go worker results carry no routes.
+// v125 (#3402): Go route hints now honor lexical declarations and captured writes;
+// namespace imports retain whether their local name comes from the package clause.
+// v126 (#3446): SDK positional tool registrations now emit tool definitions,
+// exact handler identities, and an opt-out from unrelated file-level flows.
+// Warm v125 worker results omit these definitions and must be re-extracted.
+// v127 (#3450): Destructured member writes invalidate SDK registration evidence.
+// Warm v126 worker results can retain false tools after a method replacement.
+// v128 (#3450): SDK namespace imports now prove positional tool receivers.
+// Warm v127 worker results omit these definitions and must be re-extracted.
+// v129 (#3499): Python/PHP/Ruby declaration bindings now preserve language-
+// specific module visibility. Warm v128 ParsedFiles retain the old binding
+// placement and can lose valid calls when finalized by the new projection.
+// v130 (#3502): Python globals use exact function/class block ownership and
+// Ruby ordinary-method binding uses AST markers. Warm v129 ParsedFiles retain
+// incorrect declaration scopes and must be re-extracted.
+// v131 (#3504): Python namespace imports retain explicit alias syntax. Warm
+// v130 ParsedFiles lack this fact and can bind a root-spelled alias to the
+// package root instead of the imported module.
+// v132 (#3487, #3505): merge the parallel Express route capture changes.
+// Require semantic handler arguments, retain route(path) builders, and preserve
+// app.all as method-agnostic. Both branches used v131 for different captures,
+// so invalidate either branch's cache before reusing the combined schema.
+// v133 (#3505): route(path) builders emit only chained verb registrations
+// with semantic handler arguments. Warm v132 caches can retain phantom GET
+// routes for bare builders and lose the actual methods of chained handlers.
+// v134: lexical local-import ownership, activation, lookup positions and
+// provider side-channel facts now survive worker transport and durable reuse.
+// Explicit JS/JSX embedded scripts retain their provider capture semantics.
+// Invalidate both stores together: v133 can replay file-wide import ownership
+// or TypeScript captures for an explicitly JavaScript embedded script.
+// v135: review fixes retain unambiguous conditional Python imports and ordinary
+// mutable TS/JS type facts, and preserve unchanged destructured CJS re-exports.
+// v134 stores contain the old blocked claims and must be extracted again.
+// v136: Python parameter annotations retain enclosing lookup ownership; Vue
+// JSX/TSX captures and multi-block declarations retain their source grammar
+// and original graph positions. Both stores must re-extract v135 captures.
+// v137: Python module-accessor syntax proofs and exact assigned-call provenance
+// join the existing subtype capture payload. Re-extract v136 in both stores.
+// v138: provider-owned source occurrences and new flow visitors/explicit region
+// ownership must not reuse older capture or CFG side channels.
+// v139: real rename fixtures expose missing field/read/write chains, callable
+// scopes and declaration metadata. Re-extract both stores with provider fixes.
+// v140: Ruby accessor captures retain reader visibility and singleton ownership.
+// Older worker and durable captures cannot prove property-reader dispatch.
+const SCHEMA_BUMP = 140;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from
@@ -869,6 +998,16 @@ export interface ParseCache {
    */
   usedKeys: Set<string>;
   /**
+   * Hashes this run decided it cannot vouch for — its durable generation could
+   * not be reset, or its chunk was worker-quarantined (#3204). `saveParseCache`
+   * refuses them, so neither a pre-existing `.v8` nor the chunk's durable
+   * directory survives into the next run. Kept separate from `usedKeys`
+   * because the orchestrator re-adds keys to that set after the parse phase
+   * (#2106 sibling fold), which would undo a deletion.
+   * Transient — never serialized to disk.
+   */
+  staleKeys?: Set<string>;
+  /**
    * When set, chunk payloads are loaded from / flushed to sharded files on
    * demand instead of retaining every chunk in `entries` for the whole run
    * (#1983 — Linux kernel OOM from duplicate in-memory cache + graph).
@@ -934,7 +1073,7 @@ export const computeChunkHash = (
   // default-cap runs share a key. The emit-time edge cap is deliberately
   // absent — see the PdgCacheKey doc comment.
   //
-  // NAMESPACE VERSION (`pdg:5`): bumped when the worker-emitted
+  // NAMESPACE VERSION (`pdg:6`): bumped when the worker-emitted
   // `cfgSideChannel` SHAPE changes for pdg-mode runs only — pdg:1→2 in #2083
   // M3 U1 (TsHarvester emits taint `sites` on StatementFacts); pdg:2→3 in the
   // #2227 follow-up U1 (every C-family / TS harvester now stamps the call-site
@@ -954,7 +1093,9 @@ export const computeChunkHash = (
   // byte-identical, so non-pdg users pay nothing. Deliberately NOT a SCHEMA_BUMP —
   // that gates the whole cache version and would force a full cold re-parse on
   // EVERY user (the M1 bump comment above records that cost).
-  const ns = `pdg:5;maxFn=${opts.maxFunctionLines ?? 'def'}`;
+  // pdg:5→6 preserves parse-buffer call anchors when embedded graph lines are
+  // remapped, restoring the exact-position resolved-callee join (#3532).
+  const ns = `pdg:6;maxFn=${opts.maxFunctionLines ?? 'def'}`;
   return sha256Hex(`${ns}\n${joined}`);
 };
 
@@ -1097,6 +1238,24 @@ export const persistParseCacheChunk = async (
   cache.entries.set(chunkHash, slim);
 };
 
+/**
+ * Retire a chunk this run cannot vouch for — its durable ParsedFile generation
+ * could not be reset, or its chunk was worker-quarantined (#3204).
+ *
+ * `saveParseCache` refuses a stale key, so no pre-existing `.v8` is copied
+ * forward and the durable store — pruned to exactly the keys that save
+ * returns — drops the chunk in the same step. The two deletes matter because
+ * `loadParseCacheChunk` reads `entries` and `onDiskKeys` and does NOT consult
+ * `staleKeys`: without them a second lookup of the same hash inside this run
+ * would still serve the retired shard.
+ */
+export const markParseCacheChunkStale = (cache: ParseCache, chunkHash: string): void => {
+  cache.staleKeys ??= new Set<string>();
+  cache.staleKeys.add(chunkHash);
+  cache.entries.delete(chunkHash);
+  cache.onDiskKeys?.delete(chunkHash);
+};
+
 const loadLegacyParseCache = async (storagePath: string): Promise<ParseCache> => {
   const cachePath = getLegacyCachePath(storagePath);
   try {
@@ -1182,7 +1341,14 @@ export const saveParseCache = async (storagePath: string, cache: ParseCache): Pr
   await fs.rm(tmpDir, { recursive: true, force: true });
   await fs.mkdir(tmpDir, { recursive: true });
 
-  const keys = [...cache.usedKeys].filter(isValidChunkCacheKey).sort();
+  // A stale key is dropped here rather than at the failure site: the
+  // orchestrator folds sibling-branch keys back into `usedKeys` after the parse
+  // phase (#2106), so this is the last point that sees the final key set. The
+  // exclusion also reaches the durable store, which prunes to the keys this
+  // function returns — both stores drop the chunk together (#3204).
+  const keys = [...cache.usedKeys]
+    .filter((key) => isValidChunkCacheKey(key) && !cache.staleKeys?.has(key))
+    .sort();
   // Track hashes whose shard was actually written/copied this save. A hash can
   // be in `usedKeys` without a backing shard — its in-memory serialize threw, or
   // its on-disk copy failed/was-absent (e.g. a worker-quarantined chunk added to

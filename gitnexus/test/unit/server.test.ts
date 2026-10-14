@@ -16,8 +16,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   createMCPServer,
+  getNextStepHint,
   installSignalShutdown,
   startMCPServer,
   SHUTDOWN_EXIT_CODES,
@@ -31,6 +33,8 @@ function createMockBackend(overrides: Record<string, any> = {}): any {
   return {
     callTool: vi.fn().mockResolvedValue({ result: 'ok' }),
     listRepos: vi.fn().mockResolvedValue([]),
+    countRepos: vi.fn().mockResolvedValue(0),
+    cachedRepoCount: vi.fn().mockReturnValue(0),
     resolveRepo: vi
       .fn()
       .mockResolvedValue({ name: 'test', repoPath: '/tmp/test', lastCommit: 'abc' }),
@@ -58,7 +62,7 @@ async function callToolThroughServer(
 
   try {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-    const response = await client.callTool({ name, arguments: args });
+    const response = CallToolResultSchema.parse(await client.callTool({ name, arguments: args }));
     const text = response.content.find((item) => item.type === 'text')?.text;
     if (typeof text !== 'string') throw new Error('Expected an MCP text response');
     return { text, isError: response.isError === true };
@@ -110,6 +114,7 @@ describe('createMCPServer', () => {
   });
   it('requires repo in repo-scoped tool schemas when cwd cannot resolve multiple repos', async () => {
     const backend = createMockBackend({
+      countRepos: vi.fn().mockResolvedValue(2),
       listRepos: vi.fn().mockResolvedValue([
         { name: 'alpha', path: '/tmp/alpha' },
         { name: 'beta', path: '/tmp/beta' },
@@ -128,6 +133,11 @@ describe('createMCPServer', () => {
 
       expect(query?.inputSchema.required).toContain('repo');
       expect(listRepos?.inputSchema.required).not.toContain('repo');
+      for (const name of ['read_file', 'grep'] as const) {
+        const tool = tools.tools.find((candidate) => candidate.name === name);
+        expect(tool?.inputSchema.required, name).toContain('repo');
+        expect(tool?.inputSchema.properties, name).not.toHaveProperty('branch');
+      }
       expect(
         GITNEXUS_TOOLS.find((tool) => tool.name === 'query')?.inputSchema.required,
       ).not.toContain('repo');
@@ -139,6 +149,8 @@ describe('createMCPServer', () => {
 
   it('keeps repo optional when cwd resolves one of multiple visible repos', async () => {
     const backend = createMockBackend({
+      countRepos: vi.fn().mockResolvedValue(2),
+      cachedRepoCount: vi.fn().mockReturnValue(2),
       listRepos: vi.fn().mockResolvedValue([
         { name: 'alpha', path: '/tmp/alpha' },
         { name: 'beta', path: '/tmp/beta' },
@@ -162,11 +174,12 @@ describe('createMCPServer', () => {
       const response = await client.callTool({ name: 'context', arguments: { name: 'Example' } });
       expect(response.isError).not.toBe(true);
       expect(backend.callTool).toHaveBeenCalledWith('context', { name: 'Example' });
-      expect(backend.listRepos).toHaveBeenCalledTimes(1);
+      expect(backend.countRepos).toHaveBeenCalledTimes(1);
+      expect(backend.listRepos).not.toHaveBeenCalled();
       expect(backend.selectToolRepository).toHaveBeenCalledTimes(1);
       expect(backend.selectToolRepository).toHaveBeenCalledWith(undefined, undefined, {
         allowCwdDefault: true,
-        refreshRegistry: false,
+        refreshRegistry: true,
       });
     } finally {
       await client.close();
@@ -246,6 +259,99 @@ describe('getNextStepHint (via tool call response)', () => {
     // The actual hint logic is tested via the integration path.
     expect(backend.callTool).not.toHaveBeenCalled(); // not called until request
   });
+
+  const QUERY_HINT_BASE =
+    '\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>", repo: "demo"}) to see categorized refs and process participation.';
+
+  it('query hint is unchanged when include_content is not set', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({ processes: [] }),
+    });
+    const { text } = await callToolThroughServer(backend, 'query', {
+      search_query: 'auth',
+      repo: 'demo',
+    });
+    expect(text.endsWith(QUERY_HINT_BASE)).toBe(true);
+    expect(text).not.toContain('context({uid:');
+  });
+
+  it('query hint names the context({uid, include_content}) fallback when include_content is true', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({ processes: [] }),
+    });
+    const { text } = await callToolThroughServer(backend, 'query', {
+      search_query: 'auth',
+      repo: 'demo',
+      include_content: true,
+    });
+    expect(
+      text.endsWith(
+        `${QUERY_HINT_BASE} For source of a process_symbols row without content, use context({uid: "<id>", include_content: true, repo: "demo"}).`,
+      ),
+    ).toBe(true);
+  });
+
+  it('grep hint converts the 1-based hit line to a 0-based read_file window', async () => {
+    const backend = createMockBackend({
+      callTool: vi
+        .fn()
+        .mockResolvedValue({ results: [{ filePath: 'a.ts', line: 1, text: 'signOrder()' }] }),
+    });
+    const { text } = await callToolThroughServer(backend, 'grep', {
+      pattern: 'signOrder',
+      repo: 'demo',
+    });
+    expect(text).toContain('startLine: <hit.line - 1>');
+    expect(text).toContain('endLine: <hit.line - 1>');
+    expect(text).toContain('Grep line is 1-based; read_file is 0-based');
+  });
+});
+
+describe('getNextStepHint rename', () => {
+  const apply =
+    'rename({symbol_uid: "Method:src/a.ts:A.run#0", new_name: "go", dry_run: false, repo: "demo"})';
+
+  it.each([
+    ['omitted', { symbol_uid: 'Method:src/a.ts:A.run#0', new_name: 'go', repo: 'demo' }],
+    [
+      'true',
+      { symbol_uid: 'Method:src/a.ts:A.run#0', new_name: 'go', repo: 'demo', dry_run: true },
+    ],
+  ])('points a dry run (dry_run %s) at the apply call, not at detect_changes', (_label, args) => {
+    const hint = getNextStepHint('rename', args);
+    expect(hint).toContain(apply);
+    expect(hint).toContain('no files were changed');
+    expect(hint).not.toContain('detect_changes');
+  });
+
+  it('shows the detect_changes hint only after an explicit dry_run:false', () => {
+    const hint = getNextStepHint('rename', { new_name: 'go', repo: 'demo', dry_run: false });
+    expect(hint).toContain('detect_changes({repo: "demo"})');
+    expect(hint).not.toContain('dry_run: false');
+  });
+
+  it.each([
+    ['the string "false"', 'false'],
+    ['null', null],
+    ['zero', 0],
+  ])('does not treat dry_run %s as an applied rename', (_label, dryRun) => {
+    const hint = getNextStepHint('rename', { new_name: 'go', dry_run: dryRun });
+    expect(hint).not.toContain('detect_changes');
+  });
+
+  it('names symbol_name, quoted, when no symbol_uid was sent and omits repo when absent', () => {
+    const hint = getNextStepHint('rename', { symbol_name: 'run "fast"', new_name: 'go' });
+    expect(hint).toContain(
+      'rename({symbol_name: "run \\"fast\\"", new_name: "go", dry_run: false})',
+    );
+  });
+
+  it('never suggests applying from a read-only server', () => {
+    const hint = getNextStepHint('rename', { new_name: 'go', dry_run: true }, true);
+    expect(hint).toContain('MCP read-only mode cannot apply it');
+    expect(hint).not.toContain('dry_run: false');
+    expect(hint).not.toContain('detect_changes');
+  });
 });
 
 describe('MCP output budgets', () => {
@@ -323,6 +429,88 @@ describe('MCP output budgets', () => {
     }
   });
 
+  it('rejects unknown tool arguments before backend execution (#3261)', async () => {
+    const backend = createMockBackend();
+    const { text, isError } = await callToolThroughServer(backend, 'impact', {
+      target: 'auth',
+      direction: 'downstream',
+      notARealArg: 2,
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/Unknown argument "notARealArg" for tool "impact"/);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+
+  it('accepts CLI-style depth as a known impact alias (#3261)', async () => {
+    // The CLI flag is --depth; since #3261 MCP advertises it alongside maxDepth
+    // as a compatibility alias. Before #3261, `depth` was silently dropped.
+    // After the fix it is a known alias and is forwarded.
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'impact', {
+      target: 'auth',
+      direction: 'downstream',
+      depth: 2,
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('impact', {
+      target: 'auth',
+      direction: 'downstream',
+      depth: 2,
+    });
+  });
+
+  it('still accepts unpublished context target through tools/call', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'context', {
+      repo: '@g1',
+      target: 'Sym',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('context', { repo: '@g1', target: 'Sym' });
+  });
+
+  it('still accepts the unpublished query alias for query (#2175)', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'query', {
+      query: 'auth',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('query', { query: 'auth' });
+  });
+
+  it('still accepts the unpublished query alias for cypher (#2175)', async () => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'cypher', {
+      query: 'MATCH (n) RETURN n',
+    });
+    expect(isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('cypher', { query: 'MATCH (n) RETURN n' });
+  });
+
+  it('maps legacy search/explore names through the advertised schema (#3261)', async () => {
+    const backend = createMockBackend();
+    const searchUnknown = await callToolThroughServer(backend, 'search', { notARealArg: 1 });
+    expect(searchUnknown.isError).toBe(true);
+    expect(searchUnknown.text).toMatch(/Unknown argument "notARealArg"/);
+    expect(backend.callTool).not.toHaveBeenCalled();
+
+    const searchOk = await callToolThroughServer(backend, 'search', { query: 'auth' });
+    expect(searchOk.isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('search', { query: 'auth' });
+
+    backend.callTool.mockClear();
+    const exploreUnknown = await callToolThroughServer(backend, 'explore', { notARealArg: 1 });
+    expect(exploreUnknown.isError).toBe(true);
+    expect(backend.callTool).not.toHaveBeenCalled();
+
+    const exploreOk = await callToolThroughServer(backend, 'explore', {
+      repo: '@g1',
+      target: 'Sym',
+    });
+    expect(exploreOk.isError).toBe(false);
+    expect(backend.callTool).toHaveBeenCalledWith('explore', { repo: '@g1', target: 'Sym' });
+  });
+
   it('rejects a non-positive explicit maxTokens before backend execution', async () => {
     const backend = createMockBackend();
     const { text, isError } = await callToolThroughServer(backend, 'query', {
@@ -369,6 +557,17 @@ describe('MCP output budgets', () => {
 // ─── Tool handler error handling ──────────────────────────────────────
 
 describe('server error handling', () => {
+  it('includes string Error.code in tool error text', async () => {
+    const err = Object.assign(new Error('reader refuse'), { code: 'FTS_READER_UNREPAIRABLE' });
+    const backend = createMockBackend({
+      callTool: vi.fn().mockRejectedValue(err),
+    });
+    const { text, isError } = await callToolThroughServer(backend, 'context', { name: 'auth' });
+    expect(isError).toBe(true);
+    expect(text).toContain('FTS_READER_UNREPAIRABLE');
+    expect(text).toContain('reader refuse');
+  });
+
   it('createMCPServer does not throw for valid backend', () => {
     const backend = createMockBackend();
     expect(() => createMCPServer(backend)).not.toThrow();

@@ -57,9 +57,12 @@ import { generateId } from '../../../../lib/utils.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import { canonicalizeWorkspaceBindings } from '../../scope-resolution/scope/canonicalize-bindings.js';
+import { canonicalTypeScriptName } from '../typescript/identifiers.js';
 import { simpleKey } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import { vueProvider } from '../vue.js';
 import { loadTsconfigIndex } from '../typescript/tsconfig.js';
+import { typescriptModuleExports } from '../typescript/module-exports.js';
 import { loadNodeWorkspacePackages } from '../../import-resolvers/node-workspace-packages.js';
 import { typescriptArityCompatibility, typescriptMergeBindings } from '../typescript/index.js';
 import { makeVueResolveImportTarget } from './import-target.js';
@@ -79,11 +82,16 @@ function isVueScopeContextLanguage(lang: SupportedLanguages | null): boolean {
 }
 
 const vueScopeResolver: ScopeResolver = {
+  populateWorkspaceReferences: (parsedFiles) =>
+    canonicalizeWorkspaceBindings(parsedFiles, canonicalTypeScriptName),
   language: SupportedLanguages.Vue,
   languageProvider: vueProvider,
   importEdgeReason: 'vue-scope: import',
+  importsBindAtLexicalScope: true,
+  ownedMembersBindAtModuleScope: false,
 
   resolveImportTarget: makeVueResolveImportTarget(),
+  moduleExports: typescriptModuleExports,
 
   // Vue projects universally use TypeScript — load tsconfig so path
   // aliases (`@/`, `~/`, `#/`) resolve through the standard branch.
@@ -117,6 +125,9 @@ const vueScopeResolver: ScopeResolver = {
   // Vue uses explicit imports for all external symbols; no global free-
   // call fallback needed (would produce spurious edges for built-ins).
   allowGlobalFreeCallFallback: false,
+  // Vue SFC scripts are TypeScript/JavaScript: a named import binds a module-level
+  // declaration, never a class member (see the TS resolver).
+  namedImportsBindTopLevelOnly: true,
 
   /**
    * Expand the scope-resolution file universe for Vue by performing a

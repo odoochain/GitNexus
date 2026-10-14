@@ -5,7 +5,7 @@ import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
 import CPP from 'tree-sitter-cpp';
 import Rust from 'tree-sitter-rust';
-import CSharp from 'tree-sitter-c-sharp';
+import CSharp from 'tree-sitter-c-sharp/bindings/node/index.js';
 import Go from 'tree-sitter-go';
 import {
   findEnclosingClassId,
@@ -509,24 +509,17 @@ class Outer {
     });
 
     it('returns null for a node without parent', () => {
-      // Simulate a node with null parent
-      const fakeNode = { parent: null };
-      const result = findEnclosingClassId(fakeNode, filePath);
+      const root = parseCode(TypeScript.typescript, 'const value = 1;').rootNode;
+      expect(root.parent).toBeNull();
+      const result = findEnclosingClassId(root, filePath);
       expect(result).toBeNull();
     });
 
     it('skips containers without a name node', () => {
-      // Simulate AST nodes where the class container has no name
-      const fakeClassNode = {
-        type: 'class_declaration',
-        childForFieldName: () => null,
-        children: [],
-        parent: null,
-      };
-      const fakeChild = {
-        parent: fakeClassNode,
-      };
-      const result = findEnclosingClassId(fakeChild, filePath);
+      const tree = parseCode(TypeScript.typescript, 'const Anonymous = class { method() {} };');
+      const method = findNode(tree.rootNode, (node) => node.type === 'method_definition');
+      expect(method).not.toBeNull();
+      const result = findEnclosingClassId(method!, filePath);
       // The class has no name, so should return null
       expect(result).toBeNull();
     });

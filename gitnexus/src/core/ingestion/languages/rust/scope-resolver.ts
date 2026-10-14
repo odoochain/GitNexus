@@ -19,6 +19,8 @@ import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-l
 import type { HeritageTypeArgumentSink } from '../../scope-resolution/utils/generic-instantiation.js';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import { generateId } from '../../../../lib/utils.js';
+import { rustIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { loadRustCargoTargets } from './cargo-targets.js';
 
 /**
  * Emit Rust `S IMPLEMENTS T` edges from `impl T for S` trait implementations.
@@ -156,9 +158,10 @@ export const rustScopeResolver: ScopeResolver = {
   language: SupportedLanguages.Rust,
   languageProvider: rustProvider,
   importEdgeReason: 'rust-scope: use',
+  loadResolutionConfig: loadRustCargoTargets,
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) =>
-    resolveRustImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig, context) =>
+    resolveRustImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig, context),
 
   mergeBindings: (existing, incoming, scopeId) => rustMergeBindings(existing, incoming, scopeId),
 
@@ -192,4 +195,6 @@ export const rustScopeResolver: ScopeResolver = {
   hoistTypeBindingsToModule: true,
   propagatesReturnTypesAcrossImports: true,
   allowGlobalFreeCallFallback: true,
+  importsBindAtLexicalScope: true,
+  isGlobalNameFallbackPlausible: rustIsGlobalNameFallbackPlausible,
 };

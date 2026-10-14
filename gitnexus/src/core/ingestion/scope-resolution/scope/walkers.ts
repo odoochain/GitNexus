@@ -20,7 +20,10 @@
  * as-is for TypeScript, Java, Kotlin, Ruby, etc.
  */
 
+import { lookupLexicalName, nameClaimsFor } from 'gitnexus-shared';
 import type {
+  NameLookupOptions,
+  NameClaimResult,
   BindingRef,
   ParsedFile,
   Scope,
@@ -44,6 +47,95 @@ import {
 import { definitionIdPosition } from '../utils/definition-id.js';
 
 const EMPTY_BINDINGS: readonly BindingRef[] = Object.freeze([]);
+
+interface IndexedNameLookupOptions extends NameLookupOptions {
+  /** Add same-scope candidates beside legacy local bindings. Explicit name
+   * claims still select their own candidates through the shared resolver. */
+  readonly expandLocalBindings?: (
+    scope: Scope,
+    local: readonly BindingRef[],
+    indexed: readonly BindingRef[],
+  ) => readonly BindingRef[];
+}
+
+/** Resolve ownership before any target-kind filtering or global fallback. */
+export function lookupNameClaim(
+  startScope: ScopeId,
+  name: string,
+  scopes: ScopeResolutionIndexes,
+  options: IndexedNameLookupOptions = {},
+): NameClaimResult {
+  return lookupLexicalName(
+    startScope,
+    name,
+    {
+      scopes: scopes.scopeTree,
+      importsAt: (scope) => scopes.imports?.get(scope.id) ?? scope.imports,
+      bindingsAt: (scope, spelling) => {
+        const local = scope.bindings.get(spelling) ?? [];
+        const augmented = scopes.bindingAugmentations.get(scope.id)?.get(spelling) ?? [];
+        // Unrelated claims must not change the legacy local binding tier.
+        // Providers may add candidates that share that selected tier.
+        if (local.length > 0 && nameClaimsFor(scope, spelling).length === 0) {
+          const additional =
+            options.expandLocalBindings?.(
+              scope,
+              local,
+              scopes.bindings.get(scope.id)?.get(spelling) ?? EMPTY_BINDINGS,
+            ) ?? EMPTY_BINDINGS;
+          return [
+            ...local,
+            ...additional,
+            ...augmented.filter(
+              (binding) =>
+                binding.declarationRange !== undefined || binding.availableFrom !== undefined,
+            ),
+          ];
+        }
+        return [
+          ...local,
+          ...(scopes.bindings.get(scope.id)?.get(spelling) ?? []),
+          ...augmented,
+          ...(collectNamespaceFqnBindings(scope.id, spelling, scopes) ?? []),
+          ...(scopes.workspaceFqnBindings?.get(spelling) ?? []),
+        ];
+      },
+    },
+    options,
+  );
+}
+
+/** Provider claims are strict; legacy records retain their historical kind namespaces. */
+export function hasExplicitNameClaim(claim: NameClaimResult, name: string): boolean {
+  return (
+    claim.claims.length > 0 ||
+    claim.scope?.lexicalNames?.has(name) === true ||
+    claim.imports.some((edge) => edge.linkStatus === 'unresolved')
+  );
+}
+
+function lookupMatchingNameClaim(
+  startScope: ScopeId,
+  name: string,
+  scopes: ScopeResolutionIndexes,
+  predicate: (def: SymbolDefinition) => boolean,
+  options?: NameLookupOptions,
+): NameClaimResult {
+  let current: ScopeId | null = startScope;
+  const seen = new Set<ScopeId>();
+  while (current !== null && !seen.has(current)) {
+    seen.add(current);
+    const claim = lookupNameClaim(current, name, scopes, options);
+    if (
+      claim.status === 'absent' ||
+      hasExplicitNameClaim(claim, name) ||
+      claim.bindings.some((b) => predicate(b.def))
+    )
+      return claim;
+    current = claim.scope?.lookupPolicy?.parentScope ?? claim.scope?.parent ?? null;
+  }
+  return { status: 'absent', bindings: [], imports: [], claims: [] };
+}
 
 /**
  * Look up binding refs at `scopeId` for `name`, consulting both the
@@ -181,6 +273,8 @@ export function namesAtScope(scopeId: ScopeId, scopes: ScopeResolutionIndexes): 
 export function isClassLike(t: string): boolean {
   return (
     t === 'Class' ||
+    t === 'Protocol' ||
+    t === 'Category' ||
     t === 'Interface' ||
     t === 'Struct' ||
     t === 'Record' ||
@@ -299,24 +393,32 @@ export function isReceiverOwnedButUnbound(
  * caller, suppressing a resolution costs a missing edge, while trusting a
  * corrupt scope chain costs a wrong one.
  *
- * Reads `scope.bindings` DIRECTLY rather than through `lookupBindingsAt`, and
- * that is deliberate — the opposite of the fix #2745 applied to Rust's
- * `headBoundLocally`. There the question was "is this name bound at all?", so
- * missing the finalized/augmented import channels lost real bindings. Here the
- * question is "does something LOCAL shadow the import?", and the import's own
- * finalized binding is the one thing that must NOT count: routing this through
- * `lookupBindingsAt` would find the namespace import shadowing itself and
- * suppress every namespace receiver in the workspace. Locals, parameters and
- * lexical names all live in the scope's own tables, which is exactly the set
- * this walk wants.
+ * Provider claims first select the owning declaration and its active import
+ * provenance, so a local loader does not shadow its own namespace handle.
+ * Without an explicit claim, the compatibility walk inspects local scope
+ * tables directly. Finalized import bindings must not count as local shadows
+ * in that fallback, or a namespace import would suppress itself.
  */
 export function isNamespaceNameShadowed(
   namespaceName: string,
   inScope: ScopeId,
   scopes: ScopeResolutionIndexes,
+  skipEnclosingClasses = false,
+  position?: NameLookupOptions['position'],
 ): boolean {
   const firstDot = namespaceName.indexOf('.');
   const rootName = firstDot === -1 ? namespaceName : namespaceName.slice(0, firstDot);
+  const claim = lookupNameClaim(inScope, rootName, scopes, {
+    position,
+    purpose: 'value',
+    skipEnclosingClasses,
+  });
+  if (hasExplicitNameClaim(claim, rootName)) {
+    return !claim.imports.some(
+      (edge) =>
+        edge.kind === 'namespace' && edge.targetFile !== null && edge.linkStatus !== 'unresolved',
+    );
+  }
   let currentId: ScopeId | null = inScope;
   const visited = new Set<ScopeId>();
   while (currentId !== null) {
@@ -324,6 +426,10 @@ export function isNamespaceNameShadowed(
     visited.add(currentId);
     const scope = scopes.scopeTree.getScope(currentId);
     if (scope === undefined) return true;
+    if (skipEnclosingClasses && scope.kind === 'Class' && currentId !== inScope) {
+      currentId = scope.parent;
+      continue;
+    }
     // Stop AT the module scope without inspecting it. In languages where a
     // namespace import IS a variable declaration — CommonJS
     // `const svc = require('./svc')` — the import puts its own name into the
@@ -351,25 +457,91 @@ export function isNamespaceNameShadowed(
   return true;
 }
 
+/**
+ * Does something between `inScope` and its module scope bind `name` to
+ * ANYTHING other than `def`?
+ *
+ * `isNamespaceNameShadowed` asks the same question for a namespace handle,
+ * where any local binding of the name is by definition not the import. A
+ * CONTAINER receiver needs the extra clause: the container may itself be the
+ * local declaration (`fn make() { const Local = struct {…}; … Local.go … }`),
+ * and reading that as its own shadow would suppress exactly the resolutions it
+ * is meant to permit — the #2723 mistake, one channel over.
+ *
+ * So a scope that binds the name answers immediately, and the answer is "not
+ * shadowed" only when one of that scope's bindings IS `def`. A name bound in a
+ * nearer scope to something else — a parameter, a local, a type binding — wins
+ * the lexical race, which is the whole point: `findClassBindingInScope` filters
+ * the chain by `isClassLike` and therefore cannot see that it lost it.
+ *
+ * The MODULE scope is inspected too, unlike `isNamespaceNameShadowed`, and the
+ * exemption is what makes that safe. That guard stops one rung short because a
+ * namespace import writes its own name into the module scope and would read as
+ * its own shadow (#2723); here the owner is compared by identity, so the binding
+ * that IS the owner exempts itself and only a binding to something ELSE answers
+ * `true`. Stopping short would leave the exact hole this walk exists to close:
+ * `findClassBindingInScope` steps over a module-scope binding that is not
+ * class-like and then answers from a WORKSPACE-wide qualified-name index, so
+ * `const Gauge = @import("other.zig").SOME_CONST;` in a file that never imports
+ * `Gauge.zig` would still resolve `Gauge.read` to that file's container.
+ * `lookupBindingsAt` is used at that scope and only there, because an imported
+ * alias lives in the finalized channel rather than in `scope.bindings`.
+ *
+ * Fail-closed like its sibling: a missing scope or a parent cycle answers
+ * `true`, because suppressing a resolution costs a missing edge while trusting a
+ * corrupt chain costs a wrong one.
+ */
+export function isOwnerNameShadowedBySomethingElse(
+  name: string,
+  def: SymbolDefinition,
+  inScope: ScopeId,
+  scopes: ScopeResolutionIndexes,
+): boolean {
+  let currentId: ScopeId | null = inScope;
+  const visited = new Set<ScopeId>();
+  while (currentId !== null) {
+    if (visited.has(currentId)) return true;
+    visited.add(currentId);
+    const scope = scopes.scopeTree.getScope(currentId);
+    if (scope === undefined) return true;
+    if (scope.kind !== 'Object') {
+      const isModule = scope.kind === 'Module';
+      const imported = isModule ? lookupBindingsAt(currentId, name, scopes) : [];
+      const bindsHere =
+        scope.bindings.has(name) ||
+        scope.typeBindings.has(name) ||
+        scope.lexicalNames?.has(name) === true ||
+        imported.length > 0 ||
+        scope.ownedDefs.some((d) => {
+          const qualifiedName = d.qualifiedName;
+          if (qualifiedName === undefined) return false;
+          const dot = qualifiedName.lastIndexOf('.');
+          return (dot === -1 ? qualifiedName : qualifiedName.slice(dot + 1)) === name;
+        });
+      if (bindsHere) {
+        if ((scope.bindings.get(name) ?? []).some((b) => b.def.nodeId === def.nodeId)) return false;
+        if (scope.ownedDefs.some((d) => d.nodeId === def.nodeId)) return false;
+        if (imported.some((b) => b.def.nodeId === def.nodeId)) return false;
+        return true;
+      }
+    }
+    // The module scope is the last rung, not a rung to skip: nothing above it
+    // can shadow a name for this file.
+    if (scope.kind === 'Module') return false;
+    currentId = scope.parent;
+  }
+  return true;
+}
+
 export function findReceiverTypeBinding(
   startScope: ScopeId,
   receiverName: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): TypeRef | undefined {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  let moduleScopeId: ScopeId | null = null;
-  while (currentId !== null) {
-    if (visited.has(currentId)) return undefined;
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined) return undefined;
-    const typeRef = scope.typeBindings.get(receiverName);
-    if (typeRef !== undefined) return typeRef;
-    if (scope.ownsReceivers?.has(receiverName) === true) return undefined;
-    if (scope.kind === 'Module') moduleScopeId = currentId;
-    currentId = scope.parent;
-  }
+  const claim = lookupNameClaim(startScope, receiverName, scopes, options);
+  if (claim.status !== 'absent') return claim.typeBinding;
+  const moduleScopeId = moduleScopeIdOf(startScope, scopes);
   // Fallback 1 — named namespaces accessible from this file (own + `using`d),
   // gated by `accessibleNamespacesByScope`. Consulted BEFORE the global channel
   // so a more-specific named binding wins, matching the pre-#1871 order where
@@ -431,9 +603,10 @@ export function moduleScopeIdOf(
 /**
  * Look up a class-like binding by name in the given scope's chain.
  *
- * "Class-like" covers `Class | Interface | Struct | Record | Enum |
- * Trait` via the shared `isClassLike` predicate — every kind that
- * collapses to `@scope.class` in the scope-extractor query contract.
+ * "Class-like" covers `Class | Interface | Struct | Record | Enum | Trait |
+ * Protocol | Category` via the shared `isClassLike` predicate. Objective-C
+ * protocol and category definitions are graph-side containers rather than
+ * `@scope.class` captures.
  *
  * Walks the scope chain upward and consults TWO sources at each step:
  *   1. `scope.bindings` — populated during scope-extraction Pass 2 with
@@ -459,12 +632,14 @@ export function findAllClassBindingsInScope(
   startScope: ScopeId,
   name: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): readonly SymbolDefinition[] {
-  return classBindingsVisibleFrom(
-    lexicalClassBindingsInScope(startScope, name, scopes),
-    name,
-    scopes,
-  );
+  const lookup = { purpose: 'type' as const, ...options };
+  const lexical = lexicalClassBindingsInScope(startScope, name, scopes, lookup);
+  if (lexical.length > 0) return lexical;
+  const claim = lookupNameClaim(startScope, name, scopes, lookup);
+  if (hasExplicitNameClaim(claim, name)) return [];
+  return classBindingsVisibleFrom(lexical, name, scopes);
 }
 
 /**
@@ -703,6 +878,31 @@ function soleBoundBaseName(bound: string): string | undefined {
   return base.length === 0 ? undefined : base;
 }
 
+export type ClassBindingLookup = NameLookupOptions & {
+  /** A selected class came from a workspace-name guess, rather than a
+   * binding/namespace decision. Observers must not treat it as edit proof. */
+  readonly onNameFallback?: () => void;
+  /**
+   * When false, skip the workspace-unique QualifiedNameIndex hit (and the
+   * dotted-tail variant). Default true — Go inheritance still needs that
+   * hit because namespace-style imports often create no scope binding.
+   *
+   * Constructor-form free calls pass false so a unique type name is not
+   * treated as a precise in-scope binding. Those sites belong to
+   * `pickUniqueGlobalClass`, which labels the edge as a guess and runs
+   * `isGlobalNameFallbackPlausible`.
+   */
+  readonly uniqueQualifiedNameFallback?: boolean;
+  /**
+   * `ScopeResolver.isNamespaceMemberVisible`, bound to the provider. A type
+   * reached through a namespace import (`ns.Type`) is dropped when this refuses
+   * it, as though the namespace's target files did not declare it. Absent (the
+   * default) keeps every declaration of those files, so a caller that does not
+   * pass it is unchanged.
+   */
+  readonly namespaceMemberVisible?: (def: SymbolDefinition) => boolean;
+};
+
 export function findClassBindingInScope(
   startScope: ScopeId,
   receiverName: string,
@@ -719,6 +919,7 @@ export function findClassBindingInScope(
    * selection. Only receiver-chain base and step resolution passes this.
    */
   stripDecoration?: DecorationStripper,
+  lookup?: ClassBindingLookup,
 ): SymbolDefinition | undefined {
   // A TYPE PARAMETER is not a class, and it is checked before every route below
   // rather than inside one of them because each route would otherwise reach a
@@ -727,30 +928,84 @@ export function findClassBindingInScope(
   // fallback after stripping. The declaration that introduced the parameter is
   // the only thing that knows, and it knows for all three.
   if (bindsTypeParameter(startScope, receiverName, scopes)) {
-    return resolveThroughTypeParameterBound(startScope, receiverName, scopes, stripDecoration);
+    return resolveThroughTypeParameterBound(
+      startScope,
+      receiverName,
+      scopes,
+      stripDecoration,
+      lookup,
+    );
   }
 
-  const local = walkScopeChain(startScope, receiverName, scopes, (def) => isClassLike(def.type));
+  const claim = lookupMatchingNameClaim(
+    startScope,
+    receiverName,
+    scopes,
+    (def) => isClassLike(def.type),
+    { purpose: 'type', ...lookup },
+  );
+  const local = claim.bindings.find((binding) => isClassLike(binding.def.type))?.def;
   if (local !== undefined) return local;
+  if (claim.status !== 'absent') return undefined;
+  const rootName = receiverName.split(/[.:]/, 1)[0]!;
+  if (rootName !== receiverName) {
+    const rootClaim = lookupNameClaim(startScope, rootName, scopes, { purpose: 'type', ...lookup });
+    if (rootClaim.status !== 'absent') {
+      // A selected namespace import licenses types only from its target files.
+      // A non-namespace or unresolved owner still blocks the global name index.
+      const targetFiles = new Set(
+        rootClaim.imports.flatMap((edge) =>
+          edge.kind === 'namespace' && edge.targetFile !== null && edge.linkStatus !== 'unresolved'
+            ? [edge.targetFile]
+            : [],
+        ),
+      );
+      const candidates = new Map<string, SymbolDefinition>();
+      const memberName = receiverName.slice(rootName.length).replace(/^[.:]+/, '');
+      for (const spelling of [receiverName, memberName]) {
+        for (const id of scopes.qualifiedNames.get(spelling)) {
+          const def = scopes.defs.get(id);
+          if (
+            def !== undefined &&
+            isClassLike(def.type) &&
+            targetFiles.has(def.filePath) &&
+            (lookup?.namespaceMemberVisible?.(def) ?? true)
+          )
+            candidates.set(def.nodeId, def);
+        }
+      }
+      return candidates.size === 1 ? candidates.values().next().value : undefined;
+    }
+  }
 
   // Fallback for languages (Go) where namespace-style imports don't
   // create scope bindings: resolve via QualifiedNameIndex. Only fires
   // when the scope-chain walk found nothing; single-match wins.
-  const qnames = scopes.qualifiedNames.get(receiverName);
-  if (qnames.length === 1) {
-    const def = scopes.defs.get(qnames[0]!);
-    if (def !== undefined && isClassLike(def.type)) return def;
-  }
-  // Second fallback: dotted names like "models.User" — try the simple
-  // name (tail after last dot) for languages where defs are indexed by
-  // simple name (Go). Only when the dotted lookup fails.
-  if (receiverName.includes('.')) {
-    const simple = receiverName.slice(receiverName.lastIndexOf('.') + 1);
-    if (simple.length > 0 && simple !== receiverName) {
-      const simpleIds = scopes.qualifiedNames.get(simple);
-      if (simpleIds.length === 1) {
-        const def = scopes.defs.get(simpleIds[0]!);
-        if (def !== undefined && isClassLike(def.type)) return def;
+  // Constructor-form free calls opt out — a unique type name is a guess,
+  // not proof the type is in scope (see `ClassBindingLookup`).
+  if (lookup?.uniqueQualifiedNameFallback !== false) {
+    const qnames = scopes.qualifiedNames.get(receiverName);
+    if (qnames.length === 1) {
+      const def = scopes.defs.get(qnames[0]!);
+      if (def !== undefined && isClassLike(def.type)) {
+        lookup?.onNameFallback?.();
+        return def;
+      }
+    }
+    // Second fallback: dotted names like "models.User" — try the simple
+    // name (tail after last dot) for languages where defs are indexed by
+    // simple name (Go). Only when the dotted lookup fails.
+    if (receiverName.includes('.')) {
+      const simple = receiverName.slice(receiverName.lastIndexOf('.') + 1);
+      if (simple.length > 0 && simple !== receiverName) {
+        const simpleIds = scopes.qualifiedNames.get(simple);
+        if (simpleIds.length === 1) {
+          const def = scopes.defs.get(simpleIds[0]!);
+          if (def !== undefined && isClassLike(def.type)) {
+            lookup?.onNameFallback?.();
+            return def;
+          }
+        }
       }
     }
   }
@@ -764,7 +1019,7 @@ export function findClassBindingInScope(
       const stripped = stripDecoration(current);
       if (stripped === undefined || stripped === current || stripped.length === 0) break;
       current = stripped;
-      const candidates = findAllClassBindingsInScope(startScope, current, scopes);
+      const candidates = findAllClassBindingsInScope(startScope, current, scopes, lookup);
       // Exactly one, or decline. Two same-named classes reachable from here mean
       // the decoration was carrying the only disambiguating information, and
       // picking the nearest would mint a confident wrong edge — the failure this
@@ -796,6 +1051,7 @@ function resolveThroughTypeParameterBound(
   parameterName: string,
   scopes: ScopeResolutionIndexes,
   stripDecoration?: DecorationStripper,
+  lookup?: ClassBindingLookup,
 ): SymbolDefinition | undefined {
   const bound = typeParameterAt(startScope, parameterName, scopes)?.bound;
   if (bound === undefined) return undefined;
@@ -803,7 +1059,7 @@ function resolveThroughTypeParameterBound(
   if (baseName === undefined || baseName === parameterName) return undefined;
   // A bound naming another parameter terminates here rather than recursing.
   if (bindsTypeParameter(startScope, baseName, scopes)) return undefined;
-  return findClassBindingInScope(startScope, baseName, scopes, stripDecoration);
+  return findClassBindingInScope(startScope, baseName, scopes, stripDecoration, lookup);
 }
 
 function normalizeTemplateArgToken(value: string): string {
@@ -872,8 +1128,12 @@ function lexicalClassBindingsInScope(
   startScope: ScopeId,
   name: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): readonly SymbolDefinition[] {
-  return findAllBindingsInScope(startScope, name, scopes, (def) => isClassLike(def.type));
+  return findAllBindingsInScope(startScope, name, scopes, (def) => isClassLike(def.type), {
+    purpose: 'type',
+    ...options,
+  });
 }
 
 /**
@@ -1050,9 +1310,12 @@ export function resolveClassBindingForName(
    * strip is what suppresses its fallback.
    */
   stripDecoration?: DecorationStripper,
+  lookup?: ClassBindingLookup,
 ): SymbolDefinition | undefined {
-  const direct = findClassBindingInScope(scopeId, rawClassName, scopes, stripDecoration);
+  const direct = findClassBindingInScope(scopeId, rawClassName, scopes, stripDecoration, lookup);
   if (direct !== undefined) return direct;
+  const claim = lookupNameClaim(scopeId, rawClassName, scopes, { purpose: 'type', ...lookup });
+  if (hasExplicitNameClaim(claim, rawClassName)) return undefined;
 
   // NO object-type-ALIAS fallback here, and that is a decision rather than an
   // omission. This function carried one before #2833 moved it out of
@@ -1076,7 +1339,9 @@ export function resolveClassBindingForName(
   // here" AND ground (1) of the erasure rule below, and the two asked for it
   // separately, bottoming out in the same walk for a third of the cost of every
   // lookup whose declared type carries type arguments.
-  const lexical = lexicalClassBindingsInScope(scopeId, baseName, scopes);
+  const lexical = lexicalClassBindingsInScope(scopeId, baseName, scopes, lookup);
+  const baseClaim = lookupNameClaim(scopeId, baseName, scopes, { purpose: 'type', ...lookup });
+  if (lexical.length === 0 && hasExplicitNameClaim(baseClaim, baseName)) return undefined;
 
   const wantedArgs = extractTemplateArguments(rawClassName)?.map(normalizeTemplateArgToken);
   if (wantedArgs !== undefined && wantedArgs.length > 0) {
@@ -1204,7 +1469,14 @@ export function resolveInheritanceBaseInScope(
   scopes: ScopeResolutionIndexes,
   rawQualifiedName?: string,
   enclosingClassDef?: SymbolDefinition,
+  lookup?: ClassBindingLookup,
 ): SymbolDefinition | undefined {
+  const claim = lookupNameClaim(startScope, baseName, scopes, { purpose: 'type', ...lookup });
+  if (
+    hasExplicitNameClaim(claim, baseName) &&
+    !claim.bindings.some((binding) => isClassLike(binding.def.type))
+  )
+    return undefined;
   // #1982: when the source wrote a qualified base (`Other::Inner`), resolve it
   // against the full-path QualifiedNameIndex FIRST, so a same-tail nested base
   // binds to the matching sibling instead of the first-inserted one that the
@@ -1223,7 +1495,7 @@ export function resolveInheritanceBaseInScope(
     if (qualified !== undefined) return qualified;
   }
   return (
-    findClassBindingInScope(startScope, baseName, scopes) ??
+    findClassBindingInScope(startScope, baseName, scopes, undefined, lookup) ??
     resolveAmbiguousInheritanceBaseViaImports(startScope, baseName, scopes)
   );
 }
@@ -1239,7 +1511,7 @@ export function resolveInheritanceBaseInScope(
  * unknown, or genuinely ambiguous at a key (refuse-on-tie — never guess; a
  * wrong EXTENDS edge silently corrupts impact analysis).
  */
-function resolveQualifiedInheritanceBase(
+export function resolveQualifiedInheritanceBase(
   startScope: ScopeId,
   rawQualifiedName: string,
   scopes: ScopeResolutionIndexes,
@@ -1450,6 +1722,43 @@ function dirnameOf(filePath: string): string {
 }
 
 /**
+ * True when the caller can see `classDef` through import evidence, not
+ * merely because the class name is workspace-unique.
+ *
+ * Exact imported file (`#include "user.h"`) and a finalize-resolved
+ * `targetDefId` (named `use` / `pub use` followed to the def) are
+ * precise. An import that *names* this class (`targetExportedName`)
+ * is also precise — a barrel's `targetFile` is the re-exporting module,
+ * not the defining file. A sibling-file import of a *different* name
+ * is not: `use crate::a::bar` does not make `Foo` in `a/foo.rs` visible.
+ *
+ * Directory-only matching is intentionally omitted. The same-directory
+ * tier on `resolveAmbiguousInheritanceBaseViaImports` is for picking
+ * among *ambiguous* names (C# namespace `using`); it is not proof a
+ * unique constructor type is in scope.
+ */
+export function isClassFileImportGrounded(
+  startScope: ScopeId,
+  classDef: Pick<SymbolDefinition, 'filePath' | 'nodeId'>,
+  scopes: ScopeResolutionIndexes,
+  importedName: string,
+): boolean {
+  const callerModule = moduleScopeIdOf(startScope, scopes);
+  const callerFile = scopes.scopeTree.getScope(startScope)?.filePath;
+  if (callerFile !== undefined && classDef.filePath === callerFile) return true;
+  if (callerModule === null) return false;
+  const importEdges = scopes.imports.get(callerModule);
+  if (importEdges === undefined || importEdges.length === 0) return false;
+  for (const edge of importEdges) {
+    if (edge.targetDefId !== undefined && edge.targetDefId === classDef.nodeId) return true;
+    if (edge.targetFile === null) continue;
+    if (edge.targetFile === classDef.filePath) return true;
+    if (importedName.length > 0 && edge.targetExportedName === importedName) return true;
+  }
+  return false;
+}
+
+/**
  * Predicate for value-receiver bridge: the labels for which
  * `reconcileOwnership` registers methods/fields under the def's
  * `nodeId` as the `ownerId`. Explicit allowlist so future NodeLabel
@@ -1483,8 +1792,16 @@ export function findValueBindingInScope(
   startScope: ScopeId,
   receiverName: string,
   scopes: ScopeResolutionIndexes,
+  observeClaim?: (claim: NameClaimResult) => void,
 ): SymbolDefinition | undefined {
-  return walkScopeChain(startScope, receiverName, scopes, (def) => isOwnableValueLabel(def.type));
+  return walkScopeChain(
+    startScope,
+    receiverName,
+    scopes,
+    (def) => isOwnableValueLabel(def.type),
+    undefined,
+    observeClaim,
+  );
 }
 
 /**
@@ -1522,38 +1839,12 @@ function walkScopeChain(
   name: string,
   scopes: ScopeResolutionIndexes,
   predicate: (def: SymbolDefinition) => boolean,
+  options?: NameLookupOptions,
+  observeClaim?: (claim: NameClaimResult) => void,
 ): SymbolDefinition | undefined {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId)) return undefined;
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined) return undefined;
-
-    // `Object` scopes (object/record literal bodies) are a hoist
-    // boundary only -- their members are reachable via property access,
-    // never bare identifiers, so they contribute nothing to lookup
-    // (#2545/#2551). Still traverse past to the parent.
-    if (scope.kind !== 'Object') {
-      // Local first: a `const x` in this scope shadows any imported `x`.
-      const localBindings = scope.bindings.get(name);
-      if (localBindings !== undefined) {
-        for (const b of localBindings) {
-          if (predicate(b.def)) return b.def;
-        }
-      }
-
-      // Then imported/augmented bindings — only consulted when no local match.
-      const importedBindings = lookupBindingsAt(currentId, name, scopes);
-      for (const b of importedBindings) {
-        if (predicate(b.def)) return b.def;
-      }
-    }
-
-    currentId = scope.parent;
-  }
-  return undefined;
+  const claim = lookupMatchingNameClaim(startScope, name, scopes, predicate, options);
+  observeClaim?.(claim);
+  return claim.bindings.find((binding) => predicate(binding.def))?.def;
 }
 
 /**
@@ -1570,8 +1861,9 @@ export function findCallableBindingInScope(
   startScope: ScopeId,
   callableName: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): SymbolDefinition | undefined {
-  return findAllCallableBindingsInScope(startScope, callableName, scopes)[0];
+  return findAllCallableBindingsInScope(startScope, callableName, scopes, options)[0];
 }
 
 export interface CallableBindingCandidate {
@@ -1610,31 +1902,16 @@ export function findAllCallableBindingCandidatesInScope(
   startScope: ScopeId,
   callableName: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): readonly CallableBindingCandidate[] {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId)) return [];
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined) return [];
-
-    if (scope.kind !== 'Object') {
-      const lexical = collectCallableBindingCandidates([scope.bindings.get(callableName)]);
-      if (lexical.length > 0) return lexical;
-
-      const candidates = collectCallableBindingCandidates([
-        scopes.bindings.get(currentId)?.get(callableName),
-        scopes.bindingAugmentations.get(currentId)?.get(callableName),
-        collectNamespaceFqnBindings(currentId, callableName, scopes),
-        scopes.workspaceFqnBindings?.get(callableName),
-      ]);
-      if (candidates.length > 0) return candidates;
-    }
-
-    currentId = scope.parent;
-  }
-  return [];
+  const claim = lookupMatchingNameClaim(
+    startScope,
+    callableName,
+    scopes,
+    (def) => def.type === 'Function' || def.type === 'Method' || def.type === 'Constructor',
+    options,
+  );
+  return collectCallableBindingCandidates([claim.bindings]);
 }
 
 /**
@@ -1667,132 +1944,32 @@ function findAllBindingsInScope(
   name: string,
   scopes: ScopeResolutionIndexes,
   predicate: (def: SymbolDefinition) => boolean,
+  options?: NameLookupOptions,
 ): readonly SymbolDefinition[] {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId)) return [];
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined) return [];
-
-    // `Object` scopes are a hoist boundary only -- see walkScopeChain's
-    // comment (#2545/#2551). Skip lookup here, still traverse to parent.
-    if (scope.kind !== 'Object') {
-      const out: SymbolDefinition[] = [];
-      const seen = new Set<string>();
-      const push = (def: SymbolDefinition): void => {
-        if (!predicate(def)) return;
-        if (seen.has(def.nodeId)) return;
-        seen.add(def.nodeId);
-        out.push(def);
-      };
-
-      // Local first: a binding in this scope shadows an imported one.
-      for (const b of scope.bindings.get(name) ?? []) push(b.def);
-      for (const b of lookupBindingsAt(currentId, name, scopes)) push(b.def);
-
-      if (out.length > 0) return out;
-    }
-    currentId = scope.parent;
-  }
-  return [];
+  const claim = lookupMatchingNameClaim(startScope, name, scopes, predicate, options);
+  const seen = new Set<string>();
+  return claim.bindings
+    .map((binding) => binding.def)
+    .filter((def) => {
+      if (!predicate(def) || seen.has(def.nodeId)) return false;
+      seen.add(def.nodeId);
+      return true;
+    });
 }
 
 export function findAllCallableBindingsInScope(
   startScope: ScopeId,
   callableName: string,
   scopes: ScopeResolutionIndexes,
+  options?: NameLookupOptions,
 ): readonly SymbolDefinition[] {
   return findAllBindingsInScope(
     startScope,
     callableName,
     scopes,
     (def) => def.type === 'Function' || def.type === 'Method' || def.type === 'Constructor',
+    options,
   );
-}
-
-/**
- * ISO C++ `[basic.lookup.unqual]` §7: ADL is suppressed when ordinary
- * unqualified lookup finds:
- *   - a name that is NOT a function or function template, OR
- *   - a block-scope function declaration that is NOT a using-declaration.
- *
- * Combined walker that stops at the **nearest scope** where `name` has any
- * binding (callable or non-callable) and returns:
- *   - `callables`: Function/Method/Constructor defs found at that scope
- *   - `nonCallableFound`: a non-function binding was present (variable, class, etc.)
- *   - `blockScopeDeclFound`: a callable was found at a Function or Block scope
- *     (block-scope function declaration that blocks ADL)
- *
- * One pass, one stop — no divergence between callable collection and blocker
- * detection.
- */
-export function findCallableBindingsAndAdlBlocker(
-  startScope: ScopeId,
-  name: string,
-  scopes: ScopeResolutionIndexes,
-): {
-  callables: readonly SymbolDefinition[];
-  nonCallableFound: boolean;
-  blockScopeDeclFound: boolean;
-} {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId))
-      return { callables: [], nonCallableFound: false, blockScopeDeclFound: false };
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined)
-      return { callables: [], nonCallableFound: false, blockScopeDeclFound: false };
-
-    const callables: SymbolDefinition[] = [];
-    const seen = new Set<string>();
-    let nonCallableFound = false;
-    let anyBinding = false;
-
-    const process = (def: SymbolDefinition): void => {
-      anyBinding = true;
-      if (def.type === 'Function' || def.type === 'Method' || def.type === 'Constructor') {
-        if (!seen.has(def.nodeId)) {
-          seen.add(def.nodeId);
-          callables.push(def);
-        }
-      } else {
-        nonCallableFound = true;
-      }
-    };
-
-    // `Object` scopes are a hoist boundary only (#2545/#2551) -- never
-    // reached by C++'s ADL path in practice (no language reusing this
-    // function emits `@scope.object`), guarded for consistency with the
-    // other scope-chain walkers in this file.
-    if (scope.kind !== 'Object') {
-      const localBindings = scope.bindings.get(name);
-      if (localBindings !== undefined) {
-        for (const b of localBindings) {
-          process(b.def);
-        }
-      }
-
-      const importedBindings = lookupBindingsAt(currentId, name, scopes);
-      for (const b of importedBindings) {
-        process(b.def);
-      }
-    }
-
-    if (anyBinding) {
-      // ISO C++: a block-scope function declaration (Function or Block scope)
-      // that is NOT a using-declaration blocks ADL. If we found callables at
-      // a function/block scope, ADL must be suppressed.
-      const blockScopeDeclFound =
-        callables.length > 0 && (scope.kind === 'Function' || scope.kind === 'Block');
-      return { callables, nonCallableFound, blockScopeDeclFound };
-    }
-    currentId = scope.parent;
-  }
-  return { callables: [], nonCallableFound: false, blockScopeDeclFound: false };
 }
 
 /**
@@ -2024,29 +2201,20 @@ export function findExportedDefByName(
   inScope: ScopeId,
   scopes: ScopeResolutionIndexes,
   index: WorkspaceResolutionIndex,
+  options?: NameLookupOptions,
 ): SymbolDefinition | undefined {
-  let currentId: ScopeId | null = inScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId)) break;
-    visited.add(currentId);
-    const scope = scopes.scopeTree.getScope(currentId);
-    if (scope === undefined) break;
-    // `Object` scopes are a hoist boundary only (#2545/#2551).
-    if (scope.kind !== 'Object') {
-      const local = scope.bindings.get(name);
-      if (local !== undefined) {
-        for (const b of local) {
-          if (b.def.type === 'Function' || b.def.type === 'Method') return b.def;
-        }
-      }
-      const finalized = lookupBindingsAt(currentId, name, scopes);
-      for (const b of finalized) {
-        if (b.def.type === 'Function' || b.def.type === 'Method') return b.def;
-      }
-    }
-    currentId = scope.parent;
-  }
+  const claim = lookupMatchingNameClaim(
+    inScope,
+    name,
+    scopes,
+    (def) => def.type === 'Function' || def.type === 'Method',
+    options,
+  );
+  const callable = claim.bindings.find(
+    (binding) => binding.def.type === 'Function' || binding.def.type === 'Method',
+  );
+  if (callable !== undefined) return callable.def;
+  if (hasExplicitNameClaim(claim, name)) return undefined;
   // Workspace-wide fallback: the first locally-declared callable binding
   // matching `name` across every file's Module scope (first-seen-by-file wins;
   // `origin === 'local'`, callable types Function/Method/Constructor). This is
@@ -2103,13 +2271,20 @@ export function findExportedDef(
   targetFile: string,
   memberName: string,
   index: WorkspaceResolutionIndex,
+  /**
+   * `ScopeResolver.isNamespaceMemberVisible`, already bound to the provider.
+   * Absent (the default) accepts every local binding, byte-identical to the
+   * pre-hook behaviour; present, a local def it refuses is skipped as though the
+   * target file did not declare it.
+   */
+  isVisible?: (def: SymbolDefinition) => boolean,
 ): SymbolDefinition | undefined {
   const moduleScope = index.moduleScopeByFile.get(targetFile);
   if (moduleScope === undefined) return undefined;
   const refs = moduleScope.bindings.get(memberName);
   if (refs === undefined) return undefined;
   for (const ref of refs) {
-    if (ref.origin === 'local') return ref.def;
+    if (ref.origin === 'local' && (isVisible === undefined || isVisible(ref.def))) return ref.def;
   }
   return undefined;
 }
@@ -2144,14 +2319,25 @@ export function findExportedDefIncludingImportedNames(
   memberName: string,
   index: WorkspaceResolutionIndex,
   scopes: ScopeResolutionIndexes,
+  /** See `findExportedDef`. A local declaration the predicate refuses still OWNS
+   *  the name: it must not fall through to a re-published name of the same
+   *  spelling, which would answer for a member the module itself declared. */
+  isVisible?: (def: SymbolDefinition) => boolean,
 ): SymbolDefinition | undefined {
-  const local = findExportedDef(targetFile, memberName, index);
+  const local = findExportedDef(targetFile, memberName, index, isVisible);
   if (local !== undefined) return local;
+  if (isVisible !== undefined && findExportedDef(targetFile, memberName, index) !== undefined)
+    return undefined;
   const moduleScope = index.moduleScopeByFile.get(targetFile);
   if (moduleScope === undefined) return undefined;
   let picked: SymbolDefinition | undefined;
   for (const ref of lookupBindingsAt(moduleScope.id, memberName, scopes)) {
-    if (ref.origin !== 'import' && ref.origin !== 'namespace' && ref.origin !== 'reexport')
+    if (
+      ref.origin !== 'import' &&
+      ref.origin !== 'namespace' &&
+      ref.origin !== 'reexport' &&
+      ref.origin !== 'wildcard'
+    )
       continue;
     if (picked === undefined) {
       picked = ref.def;

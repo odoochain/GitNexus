@@ -10,12 +10,13 @@ import readline from 'readline';
 import { execSync, execFileSync } from 'child_process';
 import cliProgress from 'cli-progress';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
+import { getStoragePaths, loadCLIConfig, saveCLIConfig } from '../storage/repo-manager.js';
 import {
-  getStoragePaths,
-  loadMeta,
-  loadCLIConfig,
-  saveCLIConfig,
-} from '../storage/repo-manager.js';
+  requireStoragePath,
+  STATUS_STORAGE_REQUIREMENTS,
+  StorageRequirementError,
+  isUnusableIndexInspection,
+} from '../storage/storage-resolver.js';
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
 import {
   MINIMAX_MODEL_IDS,
@@ -28,6 +29,7 @@ import { detectCursorCLI } from '../core/wiki/cursor-client.js';
 import { detectGrokCLI } from '../core/wiki/grok-client.js';
 import { detectLocalCLI } from '../core/wiki/local-cli-client.js';
 import { logger } from '../core/logger.js';
+import { parseIntegerOption } from './int-option.js';
 
 export interface WikiCommandOptions {
   force?: boolean;
@@ -45,23 +47,6 @@ export interface WikiCommandOptions {
   retries?: string;
   lang?: string;
   allowInsecureConnection?: string;
-}
-
-function parsePositiveIntegerOption(
-  value: string | undefined,
-  flag: string,
-  multiplier = 1,
-): number | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  if (!/^[1-9]\d*$/.test(trimmed)) {
-    throw new Error(`${flag} must be a positive integer`);
-  }
-  const parsed = parseInt(trimmed, 10);
-  if (parsed > Math.floor(Number.MAX_SAFE_INTEGER / multiplier)) {
-    throw new Error(`${flag} is too large`);
-  }
-  return parsed;
 }
 
 function isLocalProvider(
@@ -183,22 +168,36 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
   }
 
   // ── Check for existing index ────────────────────────────────────────
-  const { storagePath, lbugPath } = getStoragePaths(repoPath);
-  const meta = await loadMeta(storagePath);
-
-  if (!meta) {
-    console.log('  Error: No GitNexus index found.');
+  let storagePath: string;
+  try {
+    storagePath = await requireStoragePath(repoPath, STATUS_STORAGE_REQUIREMENTS);
+  } catch (error) {
+    if (!(error instanceof StorageRequirementError)) throw error;
+    const inspection = error.inspection;
+    if (!isUnusableIndexInspection(inspection)) {
+      console.log(`  Error: ${error.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`  Error: No GitNexus index found at ${error.inspection.storagePath}.`);
     console.log('  Run `gitnexus analyze` first to index this repository.\n');
     process.exitCode = 1;
     return;
   }
+  const { lbugPath } = getStoragePaths(repoPath, undefined, storagePath);
 
   let timeoutSeconds: number | undefined;
   let retries: number | undefined;
   let allowedInsecureHttpHosts: string[] | undefined;
   try {
-    timeoutSeconds = parsePositiveIntegerOption(options?.timeout, '--timeout', 1000);
-    retries = parsePositiveIntegerOption(options?.retries, '--retries');
+    timeoutSeconds =
+      options?.timeout === undefined
+        ? undefined
+        : parseIntegerOption(options.timeout, '--timeout', { minimum: 1, scale: 1000 });
+    retries =
+      options?.retries === undefined
+        ? undefined
+        : parseIntegerOption(options.retries, '--retries', { minimum: 1 });
     allowedInsecureHttpHosts =
       options?.allowInsecureConnection === undefined
         ? undefined

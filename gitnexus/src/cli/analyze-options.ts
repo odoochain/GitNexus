@@ -23,6 +23,7 @@ export interface AnalyzeOptions {
   /** Commander negated flag: false only when --no-parse-cache is passed. */
   parseCache?: boolean;
   repairFts?: boolean;
+  skipFts?: boolean;
   /**
    * Embedding generation toggle. Commander parses `--embeddings [limit]` as:
    *   - `undefined` when the flag is omitted
@@ -102,6 +103,10 @@ export interface AnalyzeOptions {
    * `allowDuplicateName` option end-to-end.
    */
   allowDuplicateName?: boolean;
+  /** `--share-with <repo>`: join that checkout's shared store (#3352). */
+  shareWith?: string;
+  /** `--no-share` sets this to false: leave the shared store (#3352). */
+  share?: boolean;
   /**
    * Override the walker's large-file skip threshold (#991). Value in KB;
    * clamped downstream to the tree-sitter 32 MB ceiling. Sets
@@ -112,8 +117,24 @@ export interface AnalyzeOptions {
   workerTimeout?: string;
   /** Control LadybugDB WAL auto-checkpoint threshold during analyze. */
   walCheckpointThreshold?: string;
+  /**
+   * `--memory-budget <mb>` (#3137): the main-thread V8 heap limit in MB.
+   * `ensureHeap` applies it through the existing heap respawn, replacing the
+   * RAM-aware auto cap and any `--max-old-space-size` pin, so the #2649
+   * guards read it as the live limit. Parse workers keep their own heap caps.
+   * Integer, minimum 200; CLI-only (not a `.gitnexusrc` key).
+   */
+  memoryBudget?: string;
   /** Parse worker pool size (>=1); 0 is rejected (no sequential mode). */
   workers?: string;
+  /** Process-detection process cap. Positive integer string; `0` is invalid. */
+  maxProcesses?: string;
+  /** Process-detection per-node branching cap. Positive integer string. */
+  maxProcessBranching?: string;
+  /** Process-detection DFS depth cap. Positive integer string. */
+  maxProcessTraceDepth?: string;
+  /** Ranked entry-point candidate pool. Positive integer string. */
+  maxEntryPointCandidates?: string;
   embeddingThreads?: string;
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;

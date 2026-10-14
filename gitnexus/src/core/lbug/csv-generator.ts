@@ -18,10 +18,12 @@ import path from 'path';
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { KnowledgeGraph } from '../graph/types.js';
 import { NodeTableName, RELATION_SCHEMA } from './schema.js';
+import type { ContentRetention } from '../../storage/repo-meta.js';
 import { VALID_NODE_TABLES, parseRelationSchemaPairs, RelPairRouter } from './rel-pair-routing.js';
 import { parseTruthyEnv } from '../ingestion/utils/env.js';
 import { SYMBOL_NODE_LABELS } from '../ingestion/utils/symbol-labels.js';
 import { applyCjkSegmentationIfEnabled } from '../search/cjk-segmentation.js';
+import { isNotebookPath, notebookPythonSnippet } from '../ingestion/ipynb-extractor.js';
 
 /** Computed once — `RELATION_SCHEMA` is a static template literal. Exported so
  *  the streamed sinks (`GraphEmitSink`, `PdgEmitSink`) share this parse
@@ -108,9 +110,13 @@ export const sanitizeUTF8 = (str: string): string => {
 };
 
 export const escapeCSVField = (value: string | number | undefined | null): string => {
-  if (value === undefined || value === null) return '""';
+  if (value === undefined || value === null) return '';
   let str = String(value);
   str = sanitizeUTF8(str);
+  // Preserve the NULL meaning of absent strings from the 0.18.3 writer.
+  // Newer LadybugDB readers retain a quoted empty field as a STRING value;
+  // it must stay unquoted or unresolved destination addresses can join.
+  if (str.length === 0) return '';
   return `"${str.replace(/"/g, '""')}"`;
 };
 
@@ -294,7 +300,16 @@ const formatFtsDescription = (description: string): string =>
 // 0-based line invariant. Kept as a named alias to read intent at the use site.
 const EXACT_SYMBOL_CONTENT_LABELS = SYMBOL_NODE_LABELS;
 
-const extractContent = async (node: GraphNode, contentCache: FileContentCache): Promise<string> => {
+const extractContent = async (
+  node: GraphNode,
+  contentCache: FileContentCache,
+  contentRetention: ContentRetention,
+): Promise<string> => {
+  // File content is intentionally lazy-read for full indexes. Do not let this
+  // compatibility path recreate source text that the selected profile forbids.
+  if (contentRetention === 'none' || (contentRetention === 'symbol' && node.label === 'File')) {
+    return '';
+  }
   const filePath = node.properties.filePath;
   const prepared = await contentCache.get(filePath);
   const content = prepared.content;
@@ -315,15 +330,24 @@ const extractContent = async (node: GraphNode, contentCache: FileContentCache): 
   const endLine = node.properties.endLine;
   if (startLine === undefined || endLine === undefined) return '';
 
+  const MAX_SNIPPET = 5000;
+  const capSnippet = (text: string): string =>
+    text.length > MAX_SNIPPET ? text.slice(0, MAX_SNIPPET) + '\n... [truncated]' : text;
+
+  const notebookPath = String(filePath ?? '');
+  if (isNotebookPath(notebookPath)) {
+    const reconstructed = notebookPythonSnippet(content, startLine, endLine, notebookPath);
+    if (reconstructed) {
+      return normalizeFtsText(applyCjkSegmentationIfEnabled(capSnippet(reconstructed)));
+    }
+  }
+
   const lines = prepared.lines;
   const exactSymbolContent = EXACT_SYMBOL_CONTENT_LABELS.has(node.label);
   const start = Math.max(0, exactSymbolContent ? startLine : startLine - 2);
   const end = Math.min(lines.length - 1, exactSymbolContent ? endLine : endLine + 2);
   const snippet = lines.slice(start, end + 1).join('\n');
-  const MAX_SNIPPET = 5000;
-  const capped =
-    snippet.length > MAX_SNIPPET ? snippet.slice(0, MAX_SNIPPET) + '\n... [truncated]' : snippet;
-  return normalizeFtsText(applyCjkSegmentationIfEnabled(capped));
+  return normalizeFtsText(applyCjkSegmentationIfEnabled(capSnippet(snippet)));
 };
 
 // ============================================================================
@@ -419,7 +443,7 @@ export const buildRelRow = (rel: GraphRelationship): string =>
  * No `name` column; blocks are identified by id + source span. Shared by the
  * whole-graph emit pass and the streaming PDG emit sink (issue #2202) so the
  * two paths produce byte-identical BasicBlock rows by construction. */
-export const BASICBLOCK_CSV_HEADER = 'id,filePath,startLine,endLine,text,callees,calleeIds';
+export const BASICBLOCK_CSV_HEADER = 'id,filePath,startLine,endLine,text,callees,calleeIds,ownerId';
 
 /** Build the escaped CSV row (no trailing newline) for one BasicBlock node.
  * Single source of the BasicBlock row bytes — used by `streamAllCSVsToDisk`
@@ -438,6 +462,7 @@ export const buildBasicBlockRow = (node: GraphNode): string =>
     escapeCSVField(node.properties.text || ''),
     escapeCSVField(String(node.properties.callees ?? '')),
     escapeCSVField(String(node.properties.calleeIds ?? '')),
+    escapeCSVField(String(node.properties.ownerId ?? '')),
   ].join(',');
 
 export interface StreamedCSVResult {
@@ -476,6 +501,7 @@ export const streamAllCSVsToDisk = async (
   repoPath: string,
   csvDir: string,
   onNodePhaseComplete?: (nodeFiles: Map<NodeTableName, { csvPath: string; rows: number }>) => void,
+  contentRetention: ContentRetention = 'full',
 ): Promise<StreamedCSVResult> => {
   // Deterministic (id-sorted) node/relationship row order when enabled;
   // default off = today's graph-insertion order (byte-identical).
@@ -568,6 +594,8 @@ export const streamAllCSVsToDisk = async (
     const multiLangHeader = 'id,name,filePath,startLine,endLine,content,description';
     const constHeader = `${multiLangHeader},convexEndpointFactory`;
     const MULTI_LANG_TYPES = [
+      'Protocol',
+      'Category',
       'Struct',
       'Enum',
       'Macro',
@@ -624,7 +652,7 @@ export const streamAllCSVsToDisk = async (
       let pending: Promise<void> | undefined;
       switch (node.label) {
         case 'File': {
-          const content = await extractContent(node, contentCache);
+          const content = await extractContent(node, contentCache, contentRetention);
           pending = fileWriter.addRow(
             [
               escapeCSVField(node.id),
@@ -679,7 +707,7 @@ export const streamAllCSVsToDisk = async (
           break;
         }
         case 'Method': {
-          const content = await extractContent(node, contentCache);
+          const content = await extractContent(node, contentCache, contentRetention);
           pending = methodWriter.addRow(
             [
               escapeCSVField(node.id),
@@ -697,7 +725,7 @@ export const streamAllCSVsToDisk = async (
           break;
         }
         case 'Section': {
-          const content = await extractContent(node, contentCache);
+          const content = await extractContent(node, contentCache, contentRetention);
           pending = sectionWriter.addRow(
             [
               escapeCSVField(node.id),
@@ -799,7 +827,7 @@ export const streamAllCSVsToDisk = async (
           // Code element nodes (Function, Class, Interface, CodeElement)
           const writer = codeWriterMap[node.label];
           if (writer) {
-            const content = await extractContent(node, contentCache);
+            const content = await extractContent(node, contentCache, contentRetention);
             const row = [
               escapeCSVField(node.id),
               escapeCSVField(node.properties.name || ''),
@@ -820,7 +848,7 @@ export const streamAllCSVsToDisk = async (
             // Multi-language node types (Struct, Impl, Trait, Macro, etc.)
             const mlWriter = multiLangWriters.get(node.label);
             if (mlWriter) {
-              const content = await extractContent(node, contentCache);
+              const content = await extractContent(node, contentCache, contentRetention);
               pending = mlWriter.addRow(
                 [
                   escapeCSVField(node.id),

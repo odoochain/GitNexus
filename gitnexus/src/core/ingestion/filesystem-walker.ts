@@ -1,6 +1,7 @@
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { DEFAULT_MAX_FILE_SIZE_BYTES, getMaxFileSizeBytes } from './utils/max-file-size.js';
 import fs from 'fs/promises';
+import { readdir } from 'node:fs';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
@@ -19,7 +20,7 @@ export interface FilePath {
   path: string;
 }
 
-const READ_CONCURRENCY = 32;
+export const READ_CONCURRENCY = 32;
 const ANALYZE_PROGRESS_ACTIVE_ENV = 'GITNEXUS_ANALYZE_PROGRESS_ACTIVE';
 
 const DECLARATION_COMPANION_SUFFIXES = [
@@ -58,6 +59,8 @@ const warnLargeFileSkip = (message: string): void => {
 };
 
 export interface WalkRepositoryOptions {
+  /** Capture required metadata before stat/size filtering can omit its inputs. */
+  onPathsDiscovered?: (paths: readonly string[]) => Promise<void>;
   /**
    * Suppress the operator-facing large-file notice. Set by read-only callers
    * such as `status`, which reuse this scan purely to learn which files the
@@ -73,7 +76,7 @@ export interface WalkRepositoryOptions {
 }
 
 /**
- * Phase 1: Scan repository — stat files to get paths + sizes, no content loaded.
+ * Phase 1: Scan repository — capture required metadata, then stat paths + sizes.
  * Memory: ~10MB for 100K files vs ~1GB+ with content.
  */
 const assertWalkRootIsDirectory = async (repoPath: string): Promise<void> => {
@@ -100,13 +103,31 @@ export const walkRepositoryPaths = async (
   await assertWalkRootIsDirectory(repoPath);
   const ignoreFilter = await createIgnoreFilter(repoPath);
   const maxFileSizeBytes = options.maxFileSizeBytes ?? getMaxFileSizeBytes();
+  let enumerationError: NodeJS.ErrnoException | undefined;
 
-  const filtered = await glob('**/*', {
-    cwd: repoPath,
-    nodir: true,
-    dot: false,
-    ignore: ignoreFilter,
-  });
+  const filtered = (
+    await glob('**/*', {
+      cwd: repoPath,
+      nodir: true,
+      dot: false,
+      ignore: ignoreFilter,
+      // glob treats unreadable directories as empty. Required metadata must
+      // not silently lose declarations, so retain the first enumeration error.
+      fs:
+        options.onPathsDiscovered === undefined
+          ? undefined
+          : {
+              readdir(directory, readOptions, callback) {
+                readdir(directory, readOptions, (error, entries) => {
+                  if (error) enumerationError ??= error;
+                  callback(error, entries);
+                });
+              },
+            },
+    })
+  ).map((filePath) => filePath.replace(/\\/g, '/'));
+  if (enumerationError !== undefined) throw enumerationError;
+  await options.onPathsDiscovered?.(filtered);
   const entries: ScannedFile[] = [];
   let processed = 0;
   let skippedLarge = 0;
@@ -120,10 +141,10 @@ export const walkRepositoryPaths = async (
         const stat = await fs.stat(fullPath);
         if (stat.size > maxFileSizeBytes) {
           skippedLarge++;
-          skippedLargePaths.push(relativePath.replace(/\\/g, '/'));
+          skippedLargePaths.push(relativePath);
           return null;
         }
-        return { path: relativePath.replace(/\\/g, '/'), size: stat.size };
+        return { path: relativePath, size: stat.size };
       }),
     );
 

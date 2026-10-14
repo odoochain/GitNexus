@@ -7,7 +7,7 @@
  *
  * Supports multiple indexed repositories via the global registry.
  *
- * Tools: list_repos, query, cypher, context, impact, detect_changes, rename
+ * Tools: list_repos, query, cypher, context, read_file, grep, impact, detect_changes, rename (preview by default; dry_run:false applies)
  * Resources: repos, repo/{name}/context, repo/{name}/clusters, ...
  */
 
@@ -42,6 +42,7 @@ import {
   mcpRepositoryPolicyConfigured,
 } from './repository-policy.js';
 import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './output-budget.js';
+import { assertKnownMcpToolArguments, schemaSourceToolName } from './tool-arguments.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -52,7 +53,11 @@ import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './o
  * Design: Each hint is a short, actionable instruction (not a suggestion).
  * The hint references the specific tool/resource to use next.
  */
-function getNextStepHint(toolName: string, args: Record<string, any> | undefined): string {
+export function getNextStepHint(
+  toolName: string,
+  args: Record<string, any> | undefined,
+  readOnly = false,
+): string {
   const repo = args?.repo;
   const repoParam = repo ? `, repo: "${repo}"` : '';
   const repoPath = repo || '{name}';
@@ -62,7 +67,7 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
       return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness. If pagination.hasMore is true, call list_repos again with offset set to pagination.nextOffset to fetch the rest.`;
 
     case 'query':
-      return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.`;
+      return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.${args?.include_content === true ? ` For source of a process_symbols row without content, use context({uid: "<id>", include_content: true${repoParam}}).` : ''}`;
 
     case 'context':
       return `\n\n---\n**Next:** If planning changes, use impact({target: "${args?.name || '<name>'}", direction: "upstream"${repoParam}}) to check blast radius. To see execution flows, READ gitnexus://repo/${repoPath}/processes.`;
@@ -73,12 +78,30 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
     case 'detect_changes':
       return `\n\n---\n**Next:** Review affected processes. Use context() on high-risk changed symbols. READ gitnexus://repo/${repoPath}/process/{name} for full execution traces.`;
 
-    case 'rename':
-      return `\n\n---\n**Next:** Run detect_changes(${repoParam ? `{repo: "${repo}"}` : ''}) to verify no unexpected side effects from the rename.`;
+    case 'rename': {
+      // Only an explicit dry_run:false can have written files. Everything else
+      // is a preview (omitted defaults to true), so the next step is to apply it,
+      // not to verify side effects that cannot exist yet.
+      if (args?.dry_run === false) {
+        return `\n\n---\n**Next:** Run detect_changes(${repoParam ? `{repo: "${repo}"}` : ''}) to verify no unexpected side effects from the rename.`;
+      }
+      if (readOnly) {
+        return `\n\n---\n**Next:** This is a preview; MCP read-only mode cannot apply it. Review semantic_edits and coverage, and apply from a client that is not read-only.`;
+      }
+      const target = args?.symbol_uid
+        ? `symbol_uid: ${JSON.stringify(args.symbol_uid)}`
+        : `symbol_name: ${JSON.stringify(args?.symbol_name ?? '<symbol_name>')}`;
+      return `\n\n---\n**Next:** Preview only; no files were changed. If status is "success", review semantic_edits and coverage, then apply with rename({${target}, new_name: ${JSON.stringify(args?.new_name ?? '<new_name>')}, dry_run: false${repoParam}}). If it failed closed, act on its code and error rather than retrying unchanged.`;
+    }
 
     case 'cypher':
       return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
 
+    case 'read_file':
+      return `\n\n---\n**Next:** To pin a symbol seen in the file, use context({name: "<symbol>"${repoParam}}). To find other occurrences, use grep({pattern: "<token>"${repoParam}}).`;
+
+    case 'grep':
+      return `\n\n---\n**Next:** Read the hit window with read_file({path: "<file>"${repoParam}, startLine: <hit.line - 1>, endLine: <hit.line - 1>}). Grep line is 1-based; read_file is 0-based. Or pin the symbol with context({name: "<symbol>"${repoParam}}).`;
     // Legacy tool names — still return useful hints
     case 'search':
       return `\n\n---\n**Next:** To understand a result in context, use context({name: "<symbol_name>"${repoParam}}).`;
@@ -90,6 +113,16 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
     default:
       return '';
   }
+}
+
+/** Include a string `Error.code` in MCP error text when present. */
+function formatMcpToolError(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Unknown error';
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code: unknown }).code
+      : undefined;
+  return typeof code === 'string' ? `Error [${code}]: ${message}` : `Error: ${message}`;
 }
 
 /**
@@ -170,13 +203,13 @@ export function createMCPServer(
           },
         ],
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
       return {
         contents: [
           {
             uri,
             mimeType: 'text/plain',
-            text: `Error: ${err.message}`,
+            text: formatMcpToolError(err),
           },
         ],
       };
@@ -200,7 +233,8 @@ export function createMCPServer(
           name: tool.name,
           description: tool.description,
           inputSchema:
-            (tool.name === 'rename' ? mutatingRequiresRepo : readOnlyRequiresRepo) &&
+            // Read-only `rename` is preview-only, so it follows the read-tool rule.
+            (tool.name === 'rename' && !readOnly ? mutatingRequiresRepo : readOnlyRequiresRepo) &&
             REPO_SCOPED_TOOLS.has(tool.name)
               ? {
                   ...tool.inputSchema,
@@ -220,10 +254,16 @@ export function createMCPServer(
     try {
       const typedArgs = args as Record<string, unknown> | undefined;
       assertMcpReadOnlyToolCall(name, typedArgs, readOnly);
+      const schemaSource = schemaSourceToolName(name);
+      const advertisedTool = GITNEXUS_TOOLS.find((tool) => tool.name === schemaSource);
+      if (advertisedTool) {
+        const listed = toolForReadOnlyMcp(repositoryPolicy.toolForMcp(advertisedTool), readOnly);
+        assertKnownMcpToolArguments(name, typedArgs, listed.inputSchema.properties);
+      }
       maxTokens = resolveMcpMaxTokens(name, typedArgs);
       const result = await scopedBackend.callTool(name, withoutMcpBudgetArg(typedArgs));
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-      const hint = getNextStepHint(name, args as Record<string, any> | undefined);
+      const hint = getNextStepHint(name, args as Record<string, any> | undefined, readOnly);
 
       return {
         content: [
@@ -234,12 +274,11 @@ export function createMCPServer(
         ],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         content: [
           {
             type: 'text',
-            text: applyMcpMaxTokens(`Error: ${message}`, maxTokens),
+            text: applyMcpMaxTokens(formatMcpToolError(error), maxTokens),
           },
         ],
         isError: true,

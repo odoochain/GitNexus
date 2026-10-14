@@ -20,16 +20,21 @@ import {
   type ParseCache,
 } from '../../src/storage/parse-cache.js';
 import { writeV8CacheFile } from '../../src/storage/v8-sidecar.js';
+import {
+  getDurableParsedFileDir,
+  loadDurableParsedFileIndex,
+  persistDurableParsedFileShardSync,
+  pruneAndSaveDurableParsedFileStore,
+} from '../../src/storage/parsedfile-store.js';
+import type { ParsedFile } from 'gitnexus-shared';
 import type { ParseWorkerResult } from '../../src/core/ingestion/workers/parse-worker.js';
 
 const minimalResult = (overrides: Partial<ParseWorkerResult> = {}): ParseWorkerResult => ({
   nodes: [],
   relationships: [],
   symbols: [],
-  imports: [],
   calls: [],
   assignments: [],
-  heritage: [],
   routes: [],
   fetchCalls: [],
   fetchWrapperDefs: [],
@@ -260,12 +265,75 @@ describe('PARSE_CACHE_VERSION', () => {
   // Moved 92 -> 93 for #3161 (Zig static gating): call captures inside a
   // comptime-false branch gain the `@reference.static-gated` marker, a
   // parse-time fact a warm cache from an earlier head would replay without.
-  it('pins SCHEMA_BUMP to 93 so concurrent bumps cannot silently collide (#2766, #3015, #3088, #2885, #3128, #2865, #3130, #1432, #3161)', () => {
-    expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).toBe(93);
+  // Moved 94 -> 95 for #3179: Objective-C framework-import-only header
+  // classification changed parse-worker output for the same file content.
+  // Moved 95 -> 96 for #3179: Objective-C macro-marker preprocessing now
+  // recognizes form feed and vertical tab as C preprocessing whitespace.
+  // Moved 96 -> 97 for #3179: comment-prefixed directives and invalid numeric
+  // marker prefixes change the parse-time normalization result.
+  // Moved 97 -> 98 for #3219 (Zig callable-value references): `ZIG_SCOPE_QUERY`
+  // gained three `@reference.value-ref` rules, so a `.zig` file now yields
+  // `value-ref` entries in `ParsedFile.referenceSites` where it yielded none.
+  // A warm pre-v98 cache replays the old, empty site list for every unchanged
+  // file — `--force` included, since shards are content-addressed — so no USES
+  // edge is emitted, the boundary probe measures a real zero, and `impact` on a
+  // registered accessor goes back to `epistemic: "exact"`: the #3399 defect,
+  // silently un-fixed on exactly the incremental path most users are on.
+  // Moved 98 -> 99 for #3190: lexical import provenance and corrected export
+  // evidence. origin/main took 98 for #3219 and 99 for #3190.
+  // Moved 99 -> 100 for #3253: retain absolute Rust import qualifiers.
+  // Moved 100 -> 101 for #3294 review: retain keyword glob paths and distinguish
+  // restricted pub(...) imports from unrestricted reexports.
+  // Moved 101 -> 102 for #3273: preserve exact call-result assignment facts
+  // required by post-resolution Swift return-type replay.
+  // Moved 102 -> 103 for #3339 review: tRPC route extraction changed —
+  // nested-router paths, a tightened entry gate, and controller-less routes
+  // now bind handlers via a same-file CALLS edge. Warm caches replay the flat
+  // pre-fix capture set verbatim, so both stores re-extract.
+  // Moved 103 -> 104 for #3339 review: pair-HOC queries name
+  // `mutation(withAuth(arrow))` object-pair handlers. Warm caches replay
+  // anonymous arrows, so both stores re-extract.
+  // Moved 104 -> 112 for #3354: callable-value flow follows `??`/`||`/`?:`
+  // branches. 105-111 are claimed by open PR #3326.
+  // Moved 112 -> 113 for #3371: notebook code-cell extraction before Python parse.
+  // Moved 113 -> 114 for #2965: C/C++ angle includes survive interpret as
+  // `isSystem` wildcards. Warm shards omitted them, so include-path lookup
+  // never ran until a full reparse. 113 stays taken by #3371.
+  // Moved 114 -> 115 for #3390: statically known Python call arity.
+  // Moved 115 -> 116 for #3390's Python subtype-dispatch shape side-channel.
+  // Moved 116 -> 117 for #3390's private positional-count side-channel.
+  // Moved 117 -> 118 for #3398, 118 -> 119 for #3396, and 119 -> 120 for #3394.
+  // Moved 120 -> 121 for the #3399 decorator-identity follow-up.
+  // Moved 121 -> 122 for #3414 restoring helper calls.
+  // Moved 122 -> 123 for #3408 FastAPI nested router-prefix capture fields.
+  // Moved 123 -> 124 for #3402 Go gin/echo decorator routes.
+  // Moved 125 -> 126 for #3446: SDK positional tool definitions and attribution.
+  // Moved 126 -> 127 for #3450: reject destructured SDK registration-method writes.
+  // Moved 127 -> 128 for #3450: recognize SDK namespace imports.
+  // Moved 128 -> 130 on main for #3499/#3502 declaration-binding corrections.
+  // Moved 128 -> 130 in parallel for #3487/#3505 Express route corrections.
+  // Moved 130 -> 131 to invalidate both incompatible branch cache schemas.
+  // Moved 131 -> 132 to combine #3504 alias facts with Express captures.
+  // Moved 132 -> 133 for #3505: only chained handler verbs register builder routes.
+  // Moved 133 -> 134 for lexical local-import facts and real-worker parity.
+  // Moved 134 -> 135 for guarded-import and mutable binding review fixes (#3532).
+  // Moved 135 -> 136 for parameter annotations and Vue embedded script fixes (#3532).
+  // Moved 136 -> 137 for Python module-accessor and call-result assignment captures (#3497).
+  // Moved 137 -> 138 for provider-owned rename occurrences and explicit flow owners (#3486).
+  // Moved 138 -> 139 for provider graph/capture fixes exercised by real rename fixtures (#3486).
+  // Moved 139 -> 140 for Ruby accessor ownership captures used by rename (#3557).
+  it('pins SCHEMA_BUMP to 140 so concurrent bumps cannot silently collide (#2766, #3015, #3088, #2885, #3128, #2865, #3130, #1432, #3161, #3179, #3219, #3190, #3253, #3273, #3339, #3354, #3371, #2965, #3390, #3398, #3396, #3394, #3399, #3414, #3408, #3402, #3446, #3450, #3499, #3502, #3487, #3505, #3504, #3497, #3486)', () => {
+    expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).toBe(140);
     expect(PARSE_CACHE_BUCKET_COUNT).toBe(128);
+    // The PREVIOUS version must fail the reuse gate, not merely differ from the
+    // current one — a hardcoded number outside the conflict hunk rebases cleanly
+    // while being wrong, which is exactly how the 37/38 exact clashes landed.
+    // Every nearby historical or in-flight value is rejected.
     for (const taken of [
       59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81,
-      82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
+      82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103,
+      104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+      123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
     ]) {
       expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).not.toBe(taken);
     }
@@ -365,6 +433,58 @@ describe('pruneCache', () => {
     const removed = pruneCache(cache, new Set(['disk-A']));
     expect(removed).toBe(2);
     expect([...(cache.onDiskKeys ?? [])].sort()).toEqual(['disk-A']);
+  });
+});
+
+describe.each([133, 134, 135])('local-import cache schema %i invalidation', (previousSchema) => {
+  // Keep this historical value independent of the production schema knob:
+  // deriving "current - 1" would pass before the required invalidation exists.
+  const previousVersion = `${previousSchema}+${PARSE_CACHE_VERSION.split('+').slice(1).join('+')}`;
+  const key = '7'.repeat(64);
+
+  it('rejects valid old parse-worker output after the ownership change', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'local-import-old-parse-cache-'));
+    try {
+      const old: ParseCache = {
+        version: previousVersion,
+        entries: new Map([[key, [minimalResult({ fileCount: 1 })]]]),
+        usedKeys: new Set([key]),
+      };
+      expect(await saveParseCache(dir, old)).toEqual([key]);
+      const index = JSON.parse(await readFile(path.join(dir, 'parse-cache', 'index.json'), 'utf8'));
+      expect(index.version).toBe(previousVersion);
+      expect(index.keys).toEqual([key]);
+      const loaded = await loadParseCache(dir);
+      expect(loaded.entries.size).toBe(0);
+      expect(loaded.onDiskKeys?.size ?? 0).toBe(0);
+      expect(await loadParseCacheChunk(loaded, key)).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects valid old durable ParsedFiles with the same version gate', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'local-import-old-parsedfiles-'));
+    try {
+      const durable = getDurableParsedFileDir(dir);
+      const old = {
+        filePath: 'old.py',
+        moduleScope: '',
+        scopes: [],
+        parsedImports: [],
+        localDefs: [],
+        referenceSites: [],
+      } as unknown as ParsedFile;
+      persistDurableParsedFileShardSync(durable, key, 1, 0, [old]);
+      await pruneAndSaveDurableParsedFileStore(durable, previousVersion, new Set([key]));
+      // Prove this is a readable old generation, not an absent/corrupt cache.
+      expect(await loadDurableParsedFileIndex(durable, previousVersion)).toEqual(
+        new Map([[key, new Set(['old.py'])]]),
+      );
+      expect(await loadDurableParsedFileIndex(durable, PARSE_CACHE_VERSION)).toEqual(new Map());
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -846,15 +966,12 @@ describe('loadParseCache / saveParseCache (round-trip)', () => {
         ['k2', 'v2'],
       ]);
       const innerSet = new Set<string>(['s1', 's2']);
-      const fake = minimalResult({
-        fileCount: 9,
-        imports: [
-          {
-            typeBindings: innerMap,
-            extras: innerSet,
-          } as unknown as ParseWorkerResult['imports'][number],
-        ],
-      });
+      // Exercise opaque structured-clone data without relying on a removed
+      // worker field (ParsedFiles intentionally live in a separate store).
+      const fake = {
+        ...minimalResult({ fileCount: 9 }),
+        serializationProbe: { typeBindings: innerMap, extras: innerSet },
+      };
       const key = 'f'.repeat(64);
       const cache: ParseCache = {
         version: PARSE_CACHE_VERSION,
@@ -869,17 +986,29 @@ describe('loadParseCache / saveParseCache (round-trip)', () => {
       expect(names.some((n) => n.endsWith('.json') && n !== 'index.json')).toBe(false);
       const loaded = await loadParseCacheChunk(cache, key);
       expect(loaded?.[0]?.fileCount).toBe(9);
-      const smuggled = loaded?.[0]?.imports[0] as unknown as {
-        typeBindings?: unknown;
-        extras?: unknown;
-      };
+      const restored = loaded?.[0];
+      if (!restored || !('serializationProbe' in restored)) {
+        throw new Error('Missing serialized probe');
+      }
+      const smuggled = restored.serializationProbe;
+      if (
+        typeof smuggled !== 'object' ||
+        smuggled === null ||
+        !('typeBindings' in smuggled) ||
+        !('extras' in smuggled)
+      ) {
+        throw new Error('Invalid serialized probe');
+      }
       expect(smuggled.typeBindings).toBeInstanceOf(Map);
-      expect([...(smuggled.typeBindings as Map<string, string>)]).toEqual([
+      expect(smuggled.extras).toBeInstanceOf(Set);
+      if (!(smuggled.typeBindings instanceof Map) || !(smuggled.extras instanceof Set)) {
+        throw new Error('Structured-clone collections were not preserved');
+      }
+      expect([...smuggled.typeBindings]).toEqual([
         ['k1', 'v1'],
         ['k2', 'v2'],
       ]);
-      expect(smuggled.extras).toBeInstanceOf(Set);
-      expect([...(smuggled.extras as Set<string>)].sort()).toEqual(['s1', 's2']);
+      expect([...smuggled.extras].sort()).toEqual(['s1', 's2']);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

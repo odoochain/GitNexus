@@ -46,6 +46,9 @@ import { extractDjangoRoutes } from '../route-extractors/django.js';
 import { discoverDjangoRootUrls } from '../route-extractors/django-root-discovery.js';
 import { extractPythonModuleConstants } from '../route-extractors/python-const-resolver.js';
 import { pythonDecoratorRouteHandlerName } from '../route-extractors/python-decorator-handler.js';
+import { assertCloneable } from '../workers/clone-safety.js';
+import { collectPythonCaptureSideChannel } from './python/module-accessors.js';
+import { pythonRenameProvider } from './python/rename.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print',
@@ -107,7 +110,8 @@ function normalizePythonStringLiteral(text: string): string | undefined {
 
 export const pythonProvider = defineLanguage({
   id: SupportedLanguages.Python,
-  extensions: ['.py'],
+  rename: pythonRenameProvider,
+  extensions: ['.py', '.ipynb'],
   entryPointPatterns: [/^app$/, /^(get|post|put|delete|patch)_/i, /^api_/, /^view_/],
   astFrameworkPatterns: [
     {
@@ -152,6 +156,8 @@ export const pythonProvider = defineLanguage({
   // full per-hook rationale and the canonical capture vocabulary in
   // ./python/query.ts (PYTHON_SCOPE_QUERY constant).
   emitScopeCaptures: emitPythonScopeCaptures,
+  collectCaptureSideChannel: (filePath) =>
+    assertCloneable(collectPythonCaptureSideChannel(filePath)),
   cfgVisitor: createPythonCfgVisitor(),
   interpretImport: interpretPythonImport,
   interpretTypeBinding: interpretPythonTypeBinding,
